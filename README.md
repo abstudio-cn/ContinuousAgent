@@ -1,268 +1,185 @@
-# ContinuousAgent（TypeScript · 浏览器版）
+# ContinuousAgent
 
-常驻本机的通用智能体：以工具为核心完成工作——读写文件、执行命令、抓取网页、操作桌面与剪贴板，并维护一份持续更新的**工作记录**与一份长期**工作笔记**。本项目从 GameAgent Web 分支而来（`..\gameragent_web` 保持原样，两者互不依赖）。
+**常驻你本机的 AI 智能体。** 它不只会读写代码——它能真的操作你的桌面：看窗口、截图、点鼠标、敲键盘、读屏幕文字，同时把「做了什么、为什么这么做」写进磁盘上的工作记录，做到跨轮次、跨重启都不丢线索。
 
-技术栈是 **TypeScript**：服务端负责 agent 循环、LLM 流式调用、工具执行与文件沙箱，浏览器端提供完整 UI。桌面版的原生能力（窗口截图、键鼠注入、Windows OCR）通过一个 **PowerShell 原生桥** 保留，因此浏览器版依然可以真正操作 GUI 应用。
+TypeScript 写就 · 零运行时依赖 · 只监听 `127.0.0.1` · Windows 原生能力 · 一套浏览器 UI 管多会话
 
-支持**多会话**：左侧会话列表可新建/切换/重命名/删除；每个会话拥有独立的对话时间线、`work_state.md`（工作记录）与 `work_notes.md`（工作笔记）（存放在 `<工作空间>/sessions/<会话ID>/`），互不干扰。
-
-> 安全提示：服务默认只监听 `127.0.0.1`。它能在你的机器上移动鼠标、按键、读文件，**不要**直接暴露到公网。要远程访问请走 SSH 隧道 / Tailscale，并设置 `CONTINUOUS_AGENT_TOKEN`（兼容旧的 `GAMEAGENT_TOKEN`）。
+> 想直接跑起来、或想接进自己的流程？看 [`readme_for_agent.md`](./readme_for_agent.md)（完整的安装、工具、HTTP 接口与排错文档）。
 
 ---
 
-## 快速开始
+## 一、它和市面上的 Agent 有什么不同
+
+市面上的 Agent 大体三类：云端 SaaS（在别人的机器上跑）、IDE 内嵌（只能碰代码和终端）、命令行 CLI（一次性任务，跑完就散）。ContinuousAgent 选了另一条路——**一个你自己的、常驻本机的、能动手也能记住的进程**。
+
+| 维度 | 常见形态 | ContinuousAgent |
+| --- | --- | --- |
+| 运行位置 | 云端容器 / IDE 插件宿主 | 一个 `node dist/server/index.js` 进程，数据全在本地磁盘 |
+| 能力边界 | 文件 + Shell + 网络 | 再加**真实 GUI**：窗口枚举、截图、键鼠注入、Windows OCR、剪贴板、进程 |
+| 观察界面的方式 | 前台截图（会抢焦点，打断你正在干的事） | `screenshot_background` 只走 `PrintWindow`：**不激活、不改前后台与叠放顺序**，窗口被遮挡也能拿到它自己的画面 |
+| 记忆 | 只活在上下文窗口里，超了就丢 | 三层落盘记忆：**工作记录**（当前状态，整份覆盖）+ **工作笔记**（长期可复用知识）+ **全局技巧库**（跨会话共享的工具经验） |
+| 何时停 | 跑满轮数 / 用户手动停 | 模型自己在完工时输出 `[[DONE]]` 收尾；凭空打转则被**重复调用熔断**刹住（最近 30 次里同一调用超 10 次即中断） |
+| 权限模型 | 要么全权、要么全否 | 默认只能写工作空间；越界写/读要**在对话里弹卡片批准**，按会话持久化；插件工具**逐次审计**，卡片必须展示用途 |
+| 出错回滚 | 靠 git 或人工 | 每次覆盖/替换前自动备份到 `changed_backup`（`原文件名__时间戳.bak`），可一键 `restore` |
+| 成本可见性 | 只给一个总数 | 每轮输入**拆成缓存命中 / 未命中**两段，配单价即出金额，顶栏、消息脚注、状态栏三处对账 |
+| 依赖体量 | 几十上百个 npm 包 | `dependencies: {}` —— 运行时零依赖，编译期只要 `typescript` |
+| 模型自由 | 绑定自家模型 | 任何 OpenAI 兼容端点（本地 llama / vLLM 也行），Key 只在服务端 |
+
+一句话概括差异：**它是「你的机器上的一个同事」，而不是「一个能看代码的聊天框」。**
+
+---
+
+## 二、运行效率（全部本机实测，可复现）
+
+测法：`node scripts/bench.mjs --json`；冷启动测法见下。数字来自本机（Node v26.12.1，Windows）。
+
+| 项目 | 实测 | 说明 |
+| --- | --- | --- |
+| 冷启动到 API 就绪 | **257 ms** | `node dist/server/index.js` → `GET /api/state` 返回 200 |
+| 常驻内存 | **62.1 MB** RSS / 13 线程 | 空载，单进程（原生桥是子进程，按需启动） |
+| token 估算（0.7 MB payload） | **0.457 ms/次** | 每次 LLM 请求前跑一次，17.6 万 token 的 payload 不到半毫秒 |
+| Markdown 渲染（20 k 字符） | **0.12 ms/次** | 单条长文档一次性渲染 |
+| 流式 100 步渲染 | **77.9 ms → 4.4 ms（17.7×）** | 旧做法每步全文重渲染；现为 `MarkdownStream` 只处理新增行 |
+| 流式 200 个 delta 的 SSE 开销 | **7 个事件 / 1.2 KB** | 合并 `item_update`，不再每个 token 推一次 |
+| 会话列表统计（5 会话 × 2 文件） | **0.484 ms/次** | `/api/state` 与会话广播都会调用，故做了内存缓存 |
+
+几处「让它跑得快」的设计取舍：
+
+- **静态资源按请求 `stat` + 流式读盘，配 ETag/`Cache-Control: no-cache`**：改完前端刷新即生效，不用重启，也不会每次全量重传。
+- **截图默认转 JPEG(60)、宽度上限 1280、只带最近 2 张**：宁可在必要时刻再截一张，也不让几张全屏 PNG 把一次请求撑到几 MB。
+- **一次请求只精确估算一次 token**，超出预算（4 MB payload / 60 万 token）才做二次收缩，避免每轮无谓地反复序列化。
+- **单进程 + 行协议原生桥**（`scripts/native-host.ps1` 常驻，stdin/stdout 传 JSON）：比每个工具调用都新起一个 PowerShell 快一个数量级。
+
+---
+
+## 三、Token 消耗比（实测，不是估算的估算）
+
+自动化实测脚本：`npm run build && node scripts/token-report.mjs`（`--json` 机读，`--turns N` 改模拟轮数）。它直接 import 编译产物里的真实实现（`estimateTokens` / `trimHistoryMessages` / `STATIC_SYSTEM_PROMPT` / `buildToolCatalog` / `defaultSettings`）来算，不是另写一份“假装跑”的模拟。
+
+### 3.1 每轮固定开销：7 603 tokens
+
+| 组成 | tokens |
+| --- | --- |
+| 静态系统提示词 | 2 485 |
+| 工具清单（43 个工具的 JSON Schema） | 5 118 |
+| **合计（每轮都要发）** | **7 603** |
+
+关键在于这 7 603 tokens 是**字节级稳定**的：系统提示词里刻意不放时间、PID、路径等易变信息（它们被挪到请求末尾的动态上下文），所以同一会话的每一轮都能命中提示词缓存。实测下来这部分占单次请求的 **66.5%**，而它恰恰是**最便宜的那部分**（缓存命中价通常是未命中的 1/10 量级）。
+
+### 3.2 同一段会话，换种做法要贵 1.84 倍
+
+模拟 40 轮持续托管（每轮 1 条带 3 次工具调用的 assistant + 3 条工具结果）：
+
+| 做法 | 累计输入 | 单次请求峰值 |
+| --- | --- | --- |
+| 朴素实现：全量历史重发、工具结果不截断 | 825.1 k | 33.0 k |
+| **本项目**：静态前缀 + 按 `historyMaxMessages=24` 裁剪 + 单条工具结果截断 20 k 字符 + 只留 2 张图 | **447.9 k** | **11.4 k** |
+| 比值 | **1.84×**（省 45.7%） | **2.9×** |
+
+裁剪不是简单砍条数：裁剪点必须落在**完整回合边界**（优先 `user` 边界），且 `assistant.tool_calls` 与对应 `tool` 结果不能被拆散；拆散了网关就直接回 HTTP 400（`Messages with role 'tool' must be a response to...`）。所以历史既做了 `sanitizeHistory()` 兜底修复（补占位结果、丢孤儿工具消息、重编冲突 id），也有专门的 400 回归脚本。
+
+### 3.3 真实会话实测：缓存命中 88.5%，输入:输出 95:1
+
+从本机 3 个真实会话的 `timeline.json` 聚合（219 轮真实 LLM 调用）：
+
+| 指标 | 实测值 |
+| --- | --- |
+| 累计输入 | 16 238 606 tokens |
+| 其中命中提示词缓存 | 14 373 248 tokens（**88.5%**） |
+| 平均每轮输入 | 74 149 tokens（命中 65 631 / 未命中 8 518） |
+| 平均每轮输出 | 778 tokens |
+| **输入 : 输出** | **95 : 1** |
+
+这张表说明两件事：**钱几乎都花在输入侧**，所以优化点在「别重复发同样的东西」（缓存、裁剪、按需截图）而不是压缩回答；而 88.5% 的命中率意味着实际计费主要落在那 8.5 k 未命中的增量上。
+
+### 3.4 一张截图值多少
+
+同一张 1718×870 的窗口画面，两种带法（像素实测，编码实测）：
+
+| 做法 | 尺寸 | payload | 视觉 token（按 w×h/750 口径） | 在历史里 |
+| --- | --- | --- | --- | --- |
+| **本项目** JPEG(60)，宽上限 1280 | 1280×648 | 75.1 KB | ≈ 1 106 | 只保留最近 2 张 |
+| 朴素做法 PNG 原尺寸 | 1718×870 | 204.4 KB | ≈ 1 993 | 每张都留在历史里 |
+
+单张差 1.8 倍（token）/ 2.72 倍（字节），再乘上「只留 2 张」，长时间挂机跑 GUI 任务的差距会持续放大。
+
+> 口径说明：token 一律用项目自带的保守估算器（CJK 1 token/字、其余 4 字符/token），与各家分词器有偏差，因此文中只做**相对倍数**比较，不冒充账单数字；视觉 token 用行业常用的像素口径 `w×h/750` 作数量级参照。金额请以你自己填的单价 × 实际 usage 为准。
+
+---
+
+## 四、三十秒上手
 
 ```powershell
 cd C:\Users\abstudio\Documents\ContinuousAgent
 npm install
-npm start            # 构建产物需先 npm run build（或直接 .\start.ps1）
+npm run build
+npm start                     # 默认 http://127.0.0.1:7800
 ```
 
-一键脚本（构建 + 启动 + 打开浏览器）：
+1. 打开 <http://127.0.0.1:7800>，右上「设置 → 接口与模型」填 OpenAI 兼容地址 / Key / 模型名；
+2. 要操作界面就点顶部「目标窗口」选一个进程；
+3. 写目标 → Enter → 它自己开始轮次推进，随时可中断。
 
-```powershell
-.\start.ps1              # 默认 7800 端口
-.\start.ps1 -Port 8080 -NoBuild
-```
+一键脚本：`.\start.ps1`（构建 + 启动 + 打开浏览器，`-Port 8080 -NoBuild` 可选）。
 
-然后：
-
-1. 打开 <http://127.0.0.1:7800>
-2. 右上「设置 → 接口与模型」填 OpenAI 兼容地址、Key、模型名
-3. （需要操作 GUI 时）顶部「目标窗口」下拉选择目标进程（列出 PID / 进程 / 客户区尺寸）
-4. 输入框写托管目标，Enter 或「开始托管」
-5. 随时「中断运行」（页面内快捷键 `F12` / `Ctrl+Shift+X`；浏览器无法注册全局热键）
-
-环境变量：`PORT`（默认 7800）、`HOST`（默认 127.0.0.1）、`CONTINUOUS_AGENT_DATA_DIR`（默认 `%APPDATA%\ContinuousAgent`，兼容 `GAMEAGENT_DATA_DIR`）、`CONTINUOUS_AGENT_TOKEN`（可选访问令牌）。
-
-首次启动若发现旧版 `%APPDATA%\GameAgentWeb\settings.json`，会自动迁移一份设置（含 Key）到新目录，工作空间改用 `Documents\ContinuousAgentWorkspace`。
+**安全提示**：服务默认只监听 `127.0.0.1`，但它能在你的机器上移动鼠标、按键、读文件。**不要**直接暴露到公网；远程访问请走 SSH 隧道 / Tailscale 并设置 `CONTINUOUS_AGENT_TOKEN`。
 
 ---
 
-## 功能对照
+## 五、文档地图
 
-| 桌面版 (C#/WPF) | 浏览器版 (TypeScript) |
+| 想知道什么 | 去哪看 |
 | --- | --- |
-| WPF 深色 UI / 三栏 | 单页 Web UI：时间线 + 记录/笔记侧栏 + 设置弹窗 |
-| `AgentRunner` 主循环 | `src/server/agent.ts`（同语义：轮次、工具调用、记录强制更新、自动续跑、历史裁剪、指数退避） |
-| `LlmClient` SSE 流式 | `src/server/llm.ts`（`reasoning_content`、tool_calls 增量、图片预算、阅后即焚、token 估算） |
-| `ToolExecutor` + `ToolCatalog` | `src/server/tools.ts`（43 个同名工具、同一套中文描述） |
-| `InputSimulator` / `ScreenCapture` / `WindowManager` / `OcrService` | `scripts/native-host.ps1` + `src/server/native.ts`（PowerShell 常驻进程，行协议 JSON） |
-| Windows DPAPI 存 Key | 只存服务端 `settings.json`，浏览器只见「已保存/未设置」 |
-| SAPI / 云端 TTS / sherpa-onnx | 浏览器 `speechSynthesis` + 云端 `/audio/speech` 代理 |
-| 全局中断热键 | 页面按钮 + 页面内快捷键（浏览器限制） |
-| 单文档 | **多会话**：每会话独立时间线 + 独立记录/笔记，可切换、重命名、删除 |
-
-**未移植**：sherpa-onnx 离线神经网络语音（Kokoro / ZipVoice）、DPAPI、全局热键、WPF 专属主题细节。朗读改用系统语音或云端 TTS。
+| 安装、环境变量、目录结构 | [`readme_for_agent.md`](./readme_for_agent.md) |
+| 43 个工具的参数与语义 | `readme_for_agent.md` → 工具清单 |
+| HTTP / SSE 接口、原生桥协议 | `readme_for_agent.md` → HTTP 接口 / 原生桥 |
+| 权限（写授权、读授权、插件审计） | `readme_for_agent.md` → 目录写权限 |
+| 自检与回归怎么跑 | `readme_for_agent.md` → 测试 |
+| 已知限制 | `readme_for_agent.md` → 已知限制 |
 
 ---
 
-## 目录结构
+## 六、历史更新记录
 
-```
-web/
-├── package.json / tsconfig.json / tsconfig.client.json
-├── start.ps1                    # 一键构建 + 启动
-├── public/
-│   ├── index.html
-│   └── styles.css               # 深色主题
-├── src/
-│   ├── shared/                  # 前后端共用类型与系统提示词
-│   │   ├── types.ts
-│   │   └── prompt.ts            # STATIC_SYSTEM_PROMPT / 记录与笔记模板
-│   ├── server/
-│   │   ├── index.ts             # HTTP + SSE + REST
-│   │   ├── agent.ts             # 主循环 + 时间线
-│   │   ├── llm.ts               # OpenAI 兼容流式客户端
-│   │   ├── tools.ts             # 工具调度 + 工具清单
-│   │   ├── record.ts            # 工作记录 / 工作笔记服务（按会话路径）
-│   │   ├── history.ts           # 历史裁剪 + 工具调用配对修复（防 HTTP 400）
-│   │   ├── settings.ts          # 设置读写与校验
-│   │   ├── paths.ts             # 路径规范化 + 工作空间沙箱
-│   │   ├── native.ts            # 原生桥客户端
-│   │   └── imagestore.ts        # 截图短期存储（SSE 只发 URL）
-│   └── client/
-│       ├── main.ts              # 时间线渲染、设置面板、事件流
-│       ├── markdown.ts          # 轻量 Markdown（先转义再渲染）
-│       └── tts.ts               # 朗读队列
-├── scripts/
-│   ├── native-host.ps1          # Win32 截图/键鼠/OCR 常驻宿主
-│   ├── selftest.mjs             # 端到端自检（需模型服务）
-│   ├── session-test.mjs         # 会话隔离自检
-│   ├── history-sequence-test.mjs # 历史工具调用配对自检（纯本地）
-│   ├── history-400-repro.mjs    # 历史截断导致 HTTP 400 的复现/回归自检
-│   └── tool-smoke.mjs           # 工具层冒烟（原生链路 + 文件沙箱）
-└── tools/mock-model.mjs         # 本地 mock 模型（无 Key 时演示/测试）
-```
+### 2026-11-15（工作区，未提交）
 
----
+- **文档重构**：原 README 转为面向使用者/agent 的完整手册 `readme_for_agent.md`；本文件改为介绍向 README，新增「独特之处 / 运行效率 / Token 消耗比 / 更新记录」四节。
+- **新增可复现实测脚本**：`scripts/token-report.mjs`（token 消耗比，含固定开销、40 轮裁剪对比、截图 payload）、`scripts/bench.mjs`（性能基准，支持 `--root` 对比旧版本）。
+- **品牌资产**：顶栏与 favicon 换成手绘 SVG 卡通灯泡（`public/assets/logo.svg` + `.brand .logo` 样式），单文件双用途。
+- **重复调用熔断**（`src/server/repeat-guard.ts`）：同一 `工具名+规范化参数` 在最近 30 次调用里出现超过 10 次即中断本轮，避免长会话原地打转烧钱；参数按键名排序后比较，`{"a":1,"b":2}` 与 `{ "b": 2, "a": 1 }` 视为同一调用。
+- **后台截图**（`screenshot_background`）：只走 `PrintWindow`，不抢焦点、不改 z 序；配合 `window-state` / 前台 hwnd 比对，可证明「截图没影响你正在用的窗口」。
+- **插件系统**（`src/server/plugins.ts`）：插件是**子进程**，核心从不 import 插件代码；清单必须写用途，每次调用弹审计卡片，允许/本会话允许/拒绝三态，审计落 `plugin_audit.jsonl`。
+- **全局技巧库**（`src/server/tips.ts`）：跨会话共享的工具经验，写入自动脱敏、拒绝项目信息、按利用频次淘汰、注入有 6 000 字符预算。
+- **成本统计**：输入拆成「缓存命中 / 未命中」两段分别计价，支持填单价与货币符号；`runtime.json` 结构不变，旧会话自动兼容。
+- **改动备份**：`write_file` 覆盖 / `edit_file` / `apply_patch` 前自动备份，`changed_backup` 可 `list` / `restore` / `clear`，任务结束只清本会话。
+- **读取申请（严格模式）**：`strictReadMode` 打开后，工作空间外的读也要卡片授权，五个读入口统一拦截。
+- **会话自动命名**：新建会话不再弹框问标题；模型在收尾前 `rename_session` 起名，服务端再用首行兜底。
+- **`exec_command` 后台执行**：`background=true` / `wait_ms` 立即返回任务 ID，配 `exec_output`（增量输出）与 `exec_kill`（整树终止）。
+- **客户端 Markdown 重写**：`renderMarkdown` + `MarkdownStream` 增量渲染，先转义再生成 HTML，支持表格/任务列表/嵌套列表/代码块复制，流式输出与一次性渲染逐字符一致。
+- **完成标记**：服务端不再生成「收到完成标记」这类文案，历史旧文案在渲染层剥离（不改写磁盘数据）。
 
-## 工具清单
+### 2026-11-14（git 提交）
 
-基础工具：`list_windows`、`select_window`（旧名 `select_game_window` 仍可用）、`get_window_info`、`screenshot`、`screenshot_background`（后台截图：只走 PrintWindow，不激活窗口、不改前后台与叠放顺序，多会话并行不抢焦点）、`mouse_move`、`mouse_click`、`mouse_drag`、`scroll`、`key_press`、`key_down`、`key_up`、`type_text`、`ocr`、`read_file`、`list_directory`、`find_files`、`write_file`、`delete_path`、`update_work_record`、`read_work_record`、`update_work_notes`、`append_work_notes`、`read_work_notes`、`get_environment`、`wait`（旧名 `update_game_record` 等仍兼容）。
-
-- 坐标：目标窗口**客户区像素**，左上 (0,0)；截图只用于观察，可能等比缩放。
-- 读：本机任意路径；写/删：仅工作空间；删除进 `<工作空间>/.trash`（7 天可恢复）。
-- 截图默认转 JPEG(60) 且宽度上限 1280，只带最近 2 张图，读过即焚。
-
-## 输入与热键
-
-| 动作 | 方式 |
+| 提交 | 内容 |
 | --- | --- |
-| 开始托管 | `Enter`（`Shift+Enter` 换行）或按钮 |
-| 中断 | 按钮 / `F12` / `Ctrl+Shift+X` |
-| 关闭设置 | `Esc` |
+| `7aa8d0f` | `[[DONE]]` 完成标记：模型确认完工即停止自动续跑 |
+| `acdf8be` | 按会话的目录写授权 + 对话内批准卡片（`request_write_access`） |
+| `467a790` | 重命名后仍兼容旧的 `game_state` / `game_notes` 会话 |
+| `5ef62cb` | 系统提示词改为工具中心叙事；记录/笔记全面改称工作记录/工作笔记 |
+| `14aaae8` | 默认端口改为 7800 |
+| `f80020b` | 品牌改为 ContinuousAgent；重做聊天 UI（逐条朗读、附件、思考强度、token 计量）；补 10 个通用工具 |
+| `d2a385f` | 从 `gameragent_web` 分支导入初始代码 |
+
+### 更早（上游基线）
+
+桌面版（C#/WPF）的能力在浏览器版里被逐项对应：`AgentRunner` 主循环 → `src/server/agent.ts`，`LlmClient` SSE → `src/server/llm.ts`，`ToolExecutor` → `src/server/tools.ts`，`InputSimulator`/`ScreenCapture`/`OcrService` → `scripts/native-host.ps1` + `src/server/native.ts`。未移植：DPAPI 存 Key、全局热键、sherpa-onnx 离线语音。
 
 ---
 
-## 原生桥（Windows）
+## 七、边界与诚实声明
 
-`scripts/native-host.ps1` 由服务端以 `powershell.exe -NoProfile` 常驻启动，通过 stdin/stdout 传递行 JSON：
-
-```
-{"id":1,"cmd":"list-windows","args":{}}
-{"id":2,"cmd":"screenshot","args":{"hwnd":"123456","maxWidth":900,"format":"jpeg"}}
-{"id":3,"cmd":"capture-bg","args":{"hwnd":"123456","maxWidth":900,"format":"jpeg"}}
-{"id":3,"cmd":"mouse-click","args":{"x":100,"y":200,"button":"left","count":1,"holdMs":45}}
-{"id":4,"cmd":"keys","args":{"action":"down","keys":"shift+w"}}
-{"id":5,"cmd":"ocr","args":{"path":"C:\\...\\shot.png","language":"zh-Hans"}}
-```
-
-- 截图优先 `PrintWindow(PW_RENDERFULLCONTENT)` 并按客户区裁剪，失败回退屏幕 `BitBlt`。
-- OCR 走 WinRT `Windows.Media.Ocr`（需系统已安装对应语言包）。
-- 键鼠走 `SendInput` / `mouse_event`，文本走 Unicode 注入（支持中文/emoji）。
-- 非 Windows 平台：`nativeAvailable=false`，界面顶部显示提示，文件/记录/笔记工具仍可用。
-- 权限：与桌面版一样，**不能**操作以管理员权限运行的窗口（UIPI 限制）。
-
----
-
-## 设置与数据
-
-| 内容 | 位置 |
-| --- | --- |
-| 设置（含 Key，仅服务端） | `%APPDATA%\GameAgentWeb\settings.json` |
-| 工作空间（默认） | `Documents\GameAgentWorkspace` |
-| 工作记录 / 笔记 | `<工作空间>\sessions\<会话ID>\work_state.md` / `work_notes.md`（按会话隔离，笔记上限 100000 字符） |
-| 会话列表与运行数据 | `%APPDATA%\GameAgentWeb\sessions\index.json`、`<会话ID>/timeline.json`、`history.json`、`runtime.json` |
-| 截图临时文件 | `%TEMP%\gameagent-web`（原生宿主即时清理） |
-
-浏览器拿到的设置永远是脱敏副本（`hasApiKey / hasCloudTtsApiKey`），Key 不回传。
-
----
-
-## HTTP 接口
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/api/state?session=<id>` | 该会话的设置（脱敏）、运行状态、目标窗口、记录、笔记、时间线 |
-| GET | `/api/sessions` | 会话列表（含运行状态与字数） |
-| POST | `/api/sessions` | 新建会话 `{title}` |
-| POST | `/api/sessions/:id/rename` \| `/delete` | 重命名 / 删除（记录移入 .trash） |
-| GET | `/api/events` | SSE：`state/item_add/item_update/clear/record/notes/target/native` |
-| POST | `/api/settings` | 局部更新设置 |
-| GET | `/api/windows` | 可见窗口列表 |
-| POST | `/api/window/select` | `{pid}` 或 `{title}` |
-| POST | `/api/window/clear` | 清除目标 |
-| POST | `/api/agent/start` \| `stop` \| `reset` \| `clear-timeline` | 运行控制（需带 `sessionId`） |
-| POST | `/api/test-connection` | 模型连通性 |
-| POST | `/api/tts` | 云端 TTS 代理（Key 不出服务端） |
-| GET | `/api/images/:id` | 工具截图 |
-
----
-
-## 测试
-
-```powershell
-# 工具层：原生截图/OCR/键鼠 + 文件沙箱（无需模型）
-node scripts/tool-smoke.mjs GameAgent
-
-# 会话隔离：在 A 会话跑一轮，确认 B 会话记录不变
-node scripts/session-test.mjs --url http://127.0.0.1:7789
-
-# 端到端：需要先启动 mock 或真实模型
-npm start
-$env:MOCK_PORT=18766; $env:MOCK_MODE='native'; node tools/mock-model.mjs   # 另开窗口
-# 设置里把 API 地址指向 http://127.0.0.1:18766/v1
-node scripts/selftest.mjs --title GameAgent --prompt "原生链路自检"
-```
-
-`selftest.mjs` 会检查：原生桥可用、窗口选择、运行结束、无错误项、记录与笔记已更新、工具全部成功。
-
----
-
-## 已知限制
-
-- 独占全屏 / GPU 合成窗口可能截不到图，建议目标应用用无边框窗口。
-- Windows OCR 依赖系统语言包，识别率与字号、缩放有关；截图上限 2400 宽。
-- 浏览器不能注册全局热键，中断只在页面聚焦时有效。
-- 同一时间只允许**一个会话**运行（否则两个会话会抢同一套键鼠），切换会话不会中断正在跑的会话。
-- 截图/目标窗口是机器级状态，不随会话切换而重置。
-- 页面刷新会重放服务端时间线；服务重启后对话历史（内存）丢失，但工作记录/笔记在磁盘上不受影响。
-- 不做反检测：在线竞技游戏使用自动化可能违反服务条款（游戏场景仍可用，但请自行判断合规性）。
-
----
-
-## ContinuousAgent 分支改动
-
-### 界面
-
-- 聊天栏**取消语音开关**：语音改到每条回复结尾的「🔊 朗读」按钮（再点变「⏹ 停止」），按需朗读，不再自动播报。
-- 输入框新增**附件**：📎 按钮 / 拖拽进输入区 / 在输入框粘贴图片。图片作为图像发给模型，文本文件（md/txt/json/code…）拼进提示词；最多 8 个，单个 ≤ 6MB。
-- 新增**思考强度**下拉（reasoning_effort：auto/minimal/low/medium/high），改动立即存到服务端设置。
-- 新增 **Token 输入/输出** 显示：顶栏汇总 + 输入区实时计量 + 每条回复脚注的本轮用量。
-- 品牌、页面标题、系统提示词、数据目录统一改为 **ContinuousAgent**。
-
-### 工具（对齐 OpenClaw agent 能力）
-
-在原有 25 个桌面/文件工具之上补齐 10 个通用工具（合计 35 个）：
-
-| 工具 | 用途 |
-| --- | --- |
-| `exec_command` | 执行 PowerShell 命令（默认工作空间，超时可配） |
-| `web_fetch` | 抓网页 / 接口，HTML 转纯文本 |
-| `edit_file` | 精确片段替换（要求唯一匹配） |
-| `apply_patch` | 一次提交多组替换 |
-| `search_files` | 正则搜索文件内容（跳过 node_modules/.git/dist） |
-| `clipboard_read` / `clipboard_write` | 读写 Windows 剪贴板 |
-| `launch_app` | Start-Process 启动程序 / 打开文档 |
-| `process_list` | 列出进程（可按名称或窗口标题过滤） |
-| `view_image` | 读取本机图片并作为图像返回 |
-
-设置 → **工具权限** 可分别关闭 `exec_command`（allowShell）与 `launch_app`（allowLaunch），并设置单条命令超时。
-
-离线验证：`node scripts/tool-verify.mjs`（不启动 HTTP 服务，直接驱动 ToolExecutor）。
-
-### 目录写权限（工作空间外）
-
-默认只有工作空间可写。需要改外部目录时：
-
-1. 模型调用 `request_write_access(path, reason)`，对话里出现一张「目录写权限申请」卡片；
-2. 用户点「允许写入」一次 — 该目录（含子目录）加入**本会话**白名单并持久化到 `%APPDATA%\ContinuousAgent\sessions\<会话ID>\grants.json`；
-3. 之后同一会话内对该目录的 `write_file / edit_file / apply_patch / delete_path` 直接放行，不再询问；点「拒绝」则本次写入失败且不会重复弹窗（模型会改为说明）。
-
-设置 → 工具权限：
-
-- `允许申请工作空间外目录`（`allowPathRequests`，默认开）— 关掉后模型只能读写工作空间；
-- `永久放行的可写目录`（`extraWritePaths`）— 每行一个绝对路径，长期生效、无需逐次确认。
-
-申请卡片 5 分钟未确认会自动失效；进程重启后残留的"待确认"卡片在页面上显示为已失效。
-
-### 完成标记（让 agent 自己停止）
-
-持续托管模式默认会一直续跑（直到 `maxTurns`，默认 500）。现在模型可以在真正完工时主动收尾：
-
-- 系统提示词要求：确认全部要求已完成并验证过 → 先 `update_work_record` 写最终状态 → 在回复**最后单独一行**输出 `[[DONE]]`。
-- 服务端只在「本轮没有任何工具调用」时才认这个标记，并从正文里剥掉，状态变为 **已完成**，自动续跑立即停止，页面弹出「✅ 模型确认任务完成」。
-- 防误判：标记必须在消息最末尾且不在未闭合的代码块里；出现在中间、后面还有内容、或在代码块示例中都不算。
-- 单轮模式（`continuousMode=false`）本来就会在完成一轮后停止，标记同样会显示为“已完成”。
-
-### 重复工具调用熔断（模型原地打转就刹车）
-
-模型偶尔会「原地打转」：同一个工具、完全相同的参数反复调用，既不产生新信息也不推进任务。服务端会主动刹车：
-
-- **判定口径**：`工具名 + 规范化参数` 构成调用指纹。参数先 `JSON.parse` 再按键名递归排序后重新序列化，所以 `{"a":1,"b":2}` 与 `'{ "b": 2, "a": 1 }'` 视为同一次调用；不是合法 JSON 的参数退回「压缩空白后的原文」。
-- **滑动窗口**：只看**最近 30 次**工具调用；同一指纹在窗口内已出现 **10 次**，第 11 次立即熔断。用滑窗而不是整轮累计，是为了不误伤持续托管的长会话（`list_windows` 这类无参工具本来就会被反复正常使用）。
-- **熔断后**：该次调用不执行，剩余调用按既有规则补「工具调用已中断，未执行」占位结果（历史仍是 tool_calls 与结果一一对应的合法序列，不会引发 HTTP 400），时间线插入一条系统提示说明是哪个工具、已出现几次，状态变为 **重复调用，已中断**，自动续跑停止。
-- 系统提示词同步写入该规则，引导模型「同一操作重复两三次没有新信息，就换参数、换工具或换思路」。
-- 实现：`src/server/repeat-guard.ts`（`RepeatGuard` / `toolCallKey` / `normalizeToolArgs`，常量 `REPEAT_LIMIT = 10`、`REPEAT_WINDOW = 30`）；`src/server/agent.ts` 主循环在 `tools.execute()` **之前**判定，判定点与占位补齐的顺序不可调换。
-- 回归：`npm run build && node scripts/repeat-guard-test.mjs`（68 项：单元 / 产物接线 / 真实循环 e2e —— 10 次不中断、第 11 次熔断、熔断后同一会话仍能续跑）。
+- **不做反检测**：在线竞技游戏用自动化可能违反服务条款，能不能用请你自行判断合规性。
+- **同一时间只允许一个会话运行**（多会话可共存、可切换，但并行跑会抢同一套键鼠）。
+- **不能操作以管理员权限运行的窗口**（UIPI 限制，与桌面版一致）。
+- **独占全屏 / GPU 合成窗口可能截不到图**，建议目标应用用无边框窗口；Windows OCR 依赖系统语言包，中文识别率一般。
+- 本文所有性能与 token 数字均为本机实测，脚本随仓库提供；换机器、换模型、换会话长度都会变，请以自己复现的结果为准。
