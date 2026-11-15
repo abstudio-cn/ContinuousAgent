@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="蓝色刷新环，环内一颗卡通灯泡">
+  <defs>
+    <linearGradient id="ca-ring" gradientUnits="userSpaceOnUse" x1="6" y1="4" x2="42" y2="44">
+      <stop offset="0%" stop-color="#6CC0FF" />
+      <stop offset="52%" stop-color="#2F80ED" />
+      <stop offset="100%" stop-color="#1A5DCE" />
+    </linearGradient>
+    <linearGradient id="ca-glass" x1="26%" y1="0%" x2="74%" y2="100%">
+      <stop offset="0%" stop-color="#FFF8CE" />
+      <stop offset="46%" stop-color="#FFD95F" />
+      <stop offset="100%" stop-color="#FFAA17" />
+    </linearGradient>
+    <linearGradient id="ca-cap" x1="18%" y1="0%" x2="82%" y2="100%">
+      <stop offset="0%" stop-color="#D6DEEB" />
+      <stop offset="52%" stop-color="#B2BDCF" />
+      <stop offset="100%" stop-color="#8A96AB" />
+    </linearGradient>
+    <radialGradient id="ca-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFDE7A" stop-opacity="0.26" />
+      <stop offset="58%" stop-color="#FFCB45" stop-opacity="0.07" />
+      <stop offset="100%" stop-color="#FFB01E" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <!-- 环内暖光（让灯泡有“亮着”的感觉） -->
+  <circle cx="24" cy="21.6" r="10" fill="url(#ca-glow)" />
+
+  <!-- 蓝色加粗刷新环：两段弧 + 两个顺时针箭头 -->
+  <g fill="none" stroke="url(#ca-ring)" stroke-width="4.4" stroke-linecap="round">
+    <path d="M32.45 8.11A18 18 0 0 1 32.45 39.89" />
+    <path d="M15.55 39.89A18 18 0 0 1 15.55 8.11" />
+  </g>
+  <g fill="url(#ca-ring)" stroke="url(#ca-ring)" stroke-width="0.5" stroke-linejoin="round">
+    <path d="M28.74 41.86L31.28 37.69L33.62 42.1Z" />
+    <path d="M19.26 6.14L16.72 10.31L14.38 5.9Z" />
+  </g>
+
+  <!-- 金属灯头 + 触点（压在玻璃罩下面） -->
+  <rect x="20.6" y="30.1" width="6.8" height="3.5" rx="1.5" fill="url(#ca-cap)" stroke="#3E2A12" stroke-width="1.7" stroke-linejoin="round" />
+  <line x1="21.7" y1="31.85" x2="26.3" y2="31.85" stroke="#3E2A12" stroke-width="0.9" stroke-linecap="round" opacity="0.45" />
+  <rect x="22.35" y="33.4" width="3.3" height="1.9" rx="0.95" fill="#A9B4C6" stroke="#3E2A12" stroke-width="1.4" stroke-linejoin="round" />
+
+  <!-- 玻璃罩（圆胖灯泡 + 收口灯泡颈） -->
+  <path d="M24 13.9C19.8 13.9 16.4 17.3 16.4 21.5C16.4 25.4 18.4 27.9 20.4 29.4C21.1 29.9 21.5 30.4 21.6 31L26.4 31C26.5 30.4 26.9 29.9 27.6 29.4C29.6 27.9 31.6 25.4 31.6 21.5C31.6 17.3 28.2 13.9 24 13.9Z"
+        fill="url(#ca-glass)" stroke="#3E2A12" stroke-width="1.9" stroke-linejoin="round" />
+
+  <!-- 高光（卡通亮面） -->
+  <ellipse cx="20.3" cy="17.8" rx="1.85" ry="2.95" fill="#FFFFFF" opacity="0.66" transform="rotate(-26 20.3 17.8)" />
+  <ellipse cx="27.9" cy="25.6" rx="1" ry="1.6" fill="#FFFFFF" opacity="0.28" transform="rotate(26 27.9 25.6)" />
+</svg>

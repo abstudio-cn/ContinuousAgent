@@ -1,0 +1,23 @@
+{
+  "name": "continuous-agent-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ContinuousAgent：常驻本机的 TypeScript / 浏览器版通用智能体（agent 循环 + Web UI）",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "start": "node dist/server/index.js",
+    "dev": "npm run build && node dist/server/index.js",
+    "selftest": "node scripts/selftest.mjs",
+    "smoke": "node scripts/tool-smoke.mjs",
+    "test:history": "node scripts/history-sequence-test.mjs",
+    "test:history-400": "node scripts/history-400-repro.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}

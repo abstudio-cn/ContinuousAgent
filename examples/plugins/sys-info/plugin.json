@@ -1,0 +1,40 @@
+{
+  "id": "sys-info",
+  "name": "系统信息（示例插件）",
+  "version": "1.0.0",
+  "purpose": "只读查看本机时间与盘符剩余空间，不修改任何文件",
+  "enabled": true,
+  "tools": [
+    {
+      "name": "now",
+      "description": "返回本机当前本地时间与时区",
+      "purpose": "只读读取系统时间",
+      "parameters": {},
+      "argv": [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'"
+      ],
+      "timeoutMs": 15000
+    },
+    {
+      "name": "free_space",
+      "description": "返回指定盘符的剩余与总空间（GB）",
+      "purpose": "只读统计盘符容量",
+      "parameters": {
+        "drive": "盘符，例如 C:"
+      },
+      "required": ["drive"],
+      "argv": [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$n = '{{drive}}'.TrimEnd(':'); $v = Get-PSDrive -Name $n -ErrorAction Stop; '{0}: 剩余 {1:N1} GB / 共 {2:N1} GB' -f $n, ($v.Free / 1GB), (($v.Used + $v.Free) / 1GB)"
+      ],
+      "timeoutMs": 20000
+    }
+  ]
+}

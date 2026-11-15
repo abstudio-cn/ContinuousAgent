@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ContinuousAgent · 浏览器托管版</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/logo.svg" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo"><img src="/assets/logo.svg" alt="ContinuousAgent" /></span>
+        <div class="brand-text">
+          <h1>ContinuousAgent</h1>
+          <span class="sub">TypeScript · 浏览器托管版</span>
+        </div>
+      </div>
+
+      <div class="target">
+        <span class="target-label">目标窗口</span>
+        <select id="windowSelect" title="选择要操作的目标窗口">
+          <option value="">（未选择）</option>
+        </select>
+        <button id="refreshWindows" class="icon-btn" title="刷新窗口列表">&#8635;</button>
+        <button id="clearWindow" class="icon-btn" title="清除目标">&#10005;</button>
+      </div>
+
+      <div class="top-right">
+        <div id="statusChip" class="status idle">空闲</div>
+        <div id="usage" class="usage" title="本次会话累计 token：入（缓存命中 / 未命中）/ 出">入 0 · 出 0 tokens</div>
+        <div id="grantsChip" class="grants-chip hidden" title="本会话已授权的额外可写目录">&#128275; 0</div>
+        <button id="settingsBtn" class="btn ghost">&#9881; 设置</button>
+      </div>
+    </header>
+
+    <div id="nativeBanner" class="banner hidden"></div>
+
+    <main>
+      <aside class="sessions">
+        <div class="sessions-head">
+          <span>会话</span>
+          <button id="newSession" class="icon-btn" title="新建会话">+</button>
+        </div>
+        <div id="sessionList" class="session-list"></div>
+        <div class="sessions-foot">每个会话独立保存工作记录与笔记</div>
+      </aside>
+
+      <section class="chat">
+        <div id="timeline" class="timeline"></div>
+        <div class="composer">
+          <div id="attachList" class="attach-list hidden"></div>
+          <textarea id="prompt" rows="3" placeholder="描述任务，例如：分析这个项目的构建脚本并修好 lint 报错。Enter 开始，Shift+Enter 换行。"></textarea>
+          <div class="composer-actions">
+            <button id="attachBtn" class="icon-btn attach-btn" title="添加附件（图片 / 文本，最多 8 个）">&#128206;</button>
+            <input id="fileInput" type="file" multiple class="file-hidden" />
+            <label class="ctl" title="reasoning_effort：模型思考强度">
+              <span>思考强度</span>
+              <select id="effortSelect">
+                <option value="auto">auto</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+            </label>
+            <span id="tokenMeter" class="token-meter" title="本次会话累计 token：入（缓存命中 / 未命中）/ 出">入 0 · 出 0</span>
+            <span class="spacer"></span>
+            <button id="resetBtn" class="btn ghost">重置</button>
+            <button id="stopBtn" class="btn danger" disabled>中断运行</button>
+            <button id="startBtn" class="btn primary">开始任务</button>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <div class="tabs">
+          <button data-tab="record" class="tab active">工作记录</button>
+          <button data-tab="notes" class="tab">工作笔记</button>
+        </div>
+        <div class="doc-meta" id="docMeta"></div>
+        <div id="docView" class="doc md"></div>
+      </aside>
+    </main>
+
+    <div id="settingsOverlay" class="overlay hidden">
+      <div class="modal">
+        <div class="modal-head">
+          <h2>设置</h2>
+          <button id="closeSettings" class="icon-btn" title="关闭">&#10005;</button>
+        </div>
+        <div class="modal-body">
+          <nav id="settingsNav" class="settings-nav"></nav>
+          <div id="settingsBody" class="settings-body"></div>
+        </div>
+        <div class="modal-foot">
+          <span id="settingsHint" class="hint"></span>
+          <span class="spacer"></span>
+          <button id="testConnection" class="btn ghost">测试连接</button>
+          <button id="saveSettings" class="btn primary">保存设置</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+  <script type="module" src="/app/client/main.js"></script>
+</body>
+</html>
