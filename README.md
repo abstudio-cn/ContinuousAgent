@@ -110,7 +110,7 @@ TypeScript 写就 · 零运行时依赖 · 只监听 `127.0.0.1` · Windows 原�
 ## 四、三十秒上手
 
 ```powershell
-cd C:\Users\abstudio\Documents\ContinuousAgent
+cd %USERPROFILE%\Documents\ContinuousAgent
 npm install
 npm run build
 npm start                     # 默认 http://127.0.0.1:7800
