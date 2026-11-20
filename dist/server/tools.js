@@ -6,6 +6,7 @@ import { NOTES_MAX_CHARS, TIP_MAX_CHARS } from '../shared/prompt.js';
 import { WorkNotesService, WorkRecordService } from './record.js';
 import { ensureDir, isInsideWorkspace, normalizePath, stamp } from './paths.js';
 import { ChangedBackupStore } from './backup.js';
+import { SCENES, enhanceToolDescription, getScene, isSceneId, sceneGuideBlock } from '../shared/scenes.js';
 function err(msg) {
     return { text: msg, isError: true };
 }
@@ -76,6 +77,23 @@ function asBool(v, def) {
         return v.toLowerCase() === 'true';
     return def;
 }
+/** 把「硬截断」位置回退到 UTF-8 字符边界：返回最后一个完整字符之后的下标（全是连续字节时原样返回）。 */
+function safeTextEnd(buf) {
+    const n = buf.length;
+    if (n === 0)
+        return 0;
+    let i = n - 1;
+    let steps = 0;
+    while (i >= 0 && steps < 4 && (buf[i] & 0xc0) === 0x80) {
+        i--;
+        steps += 1;
+    }
+    if (i < 0)
+        return n;
+    const b = buf[i];
+    const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+    return i + need <= n ? n : i;
+}
 function looksBinary(buf) {
     const n = Math.min(buf.length, 4096);
     for (let i = 0; i < n; i++)
@@ -104,6 +122,12 @@ function htmlToText(html) {
         .replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/g, "'");
     return s.replace(/[ \t]+/g, ' ').replace(/\n\s*\n\s*\n+/g, '\n\n').trim();
 }
+/**
+ * 击杀进程树后等 close 事件的宽限期（毫秒）。
+ * 孙进程可能仍持有 stdout/stderr 管道句柄（taskkill /T 未必清得干净），
+ * 一旦如此 close 永不到来，结果就永远结算不了——超时后必须兜底。
+ */
+const KILL_GRACE_MS = 3000;
 /** 启动子进程并收集输出（输出上限 512KB，超时或中断会 kill）。 */
 /** 单个子进程的实时句柄：结束前也能读当前输出，可强杀整棵进程树。 */
 class Proc {
@@ -113,7 +137,10 @@ class Proc {
     done = false;
     code = null;
     timedOut = false;
+    forced = false;
     truncated = false;
+    /** 由构造函数注入：击杀后布防强制结算。 */
+    forceKillHook = null;
     result;
     constructor(cmd, args, opts = {}) {
         let resolveResult = () => { };
@@ -126,6 +153,7 @@ class Proc {
         let outBytes = 0;
         let errBytes = 0;
         let timer = null;
+        let forceTimer = null;
         let onAbort = null;
         const finish = (code, extra = '') => {
             if (this.done)
@@ -134,17 +162,53 @@ class Proc {
             this.code = code;
             if (timer)
                 clearTimeout(timer);
+            if (forceTimer) {
+                clearTimeout(forceTimer);
+                forceTimer = null;
+            }
             if (opts.signal && onAbort)
                 opts.signal.removeEventListener('abort', onAbort);
             if (!this.truncated) {
                 this.outText += outDecoder.end();
                 this.errText += errDecoder.end();
             }
-            resolveResult({ code, stdout: this.outText, stderr: this.errText + extra, timedOut: this.timedOut });
+            resolveResult({
+                code,
+                stdout: this.outText,
+                stderr: this.errText + extra,
+                timedOut: this.timedOut,
+                forced: this.forced,
+            });
         };
+        // 击杀后兜底结算：正常情况下 close 几十毫秒内就来并清掉这个定时器；
+        // 万一孙进程占着管道不放（chrome 的 crashpad/gpu 子进程就是典型），
+        // 也不会让调用方无限挂起。
+        const armForceFinish = () => {
+            if (forceTimer || this.done)
+                return;
+            const t = setTimeout(() => {
+                forceTimer = null;
+                if (this.done)
+                    return;
+                this.forced = true;
+                finish(this.code ?? -1, '\n（进程树已终止，但输出管道仍被占用，已在击杀后 ' +
+                    Math.round(KILL_GRACE_MS / 1000) +
+                    ' 秒强制结算）');
+            }, KILL_GRACE_MS);
+            t.unref();
+            forceTimer = t;
+        };
+        this.forceKillHook = armForceFinish;
         onAbort = () => this.killTree();
         try {
-            this.child = spawn(cmd, args, { cwd: opts.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+            // 非 Windows：让子进程自成进程组（pgid === pid），killTree 才能对整组发信号，
+            // 连已经 reparent 到 init 的孙进程一起杀掉；Windows 仍用 taskkill /T 枚举进程树，选项不变。
+            this.child = spawn(cmd, args, {
+                cwd: opts.cwd,
+                windowsHide: true,
+                detached: process.platform !== 'win32',
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
         }
         catch (e) {
             this.done = true;
@@ -188,7 +252,7 @@ class Proc {
             /* ignore */
         }
     }
-    /** 强杀整棵进程树：Windows 用 taskkill /T /F，其他平台 SIGKILL。 */
+    /** 强杀整棵进程树：Windows 用 taskkill /T /F；其他平台对进程组发 SIGKILL（含孙进程）。 */
     killTree() {
         const child = this.child;
         if (!child || this.done)
@@ -201,12 +265,24 @@ class Proc {
                 /* ignore */
             }
         }
+        else if (child.pid && child.pid > 1) {
+            // 子进程以 detached 启动，自身即进程组组长，负 pid 一次清掉整组；
+            // 直接 child.kill('SIGKILL') 只能杀直接子进程，孙进程会逃逸并被 reparent 到 init。
+            try {
+                process.kill(-child.pid, 'SIGKILL');
+            }
+            catch {
+                /* 进程组已不存在时继续走下面的单进程兜底 */
+            }
+        }
         try {
             child.kill('SIGKILL');
         }
         catch {
             /* ignore */
         }
+        // 布防强制结算：close 事件若因管道被占用而永不到来，宽限期后也能把结果交出去
+        this.forceKillHook?.();
     }
 }
 /** 启动子进程并收集输出（结束才返回；调用方也可以直接用 Proc 拿实时句柄）。 */
@@ -224,6 +300,10 @@ function parsePathList(raw) {
 /** 同时运行的后台任务上限与已完成任务保留数。 */
 const MAX_RUNNING_JOBS = 12;
 const KEEP_FINISHED_JOBS = 10;
+/** read_file 单次读取上限（字节）：默认窗口 262144，上限防止一次返回撑爆上下文。 */
+const READ_FILE_MAX_BYTES = 1024 * 1024;
+/** 截断时最多回退多少字节以对齐到行首（回退过多会让单页有效内容变少）。 */
+const READ_LINE_ALIGN_SLACK = 4096;
 export class ToolExecutor {
     settings;
     native;
@@ -245,6 +325,12 @@ export class ToolExecutor {
     pluginAuditor = null;
     /** 会话改名回调：由外层注入（写 SessionStore 并广播），供模型在收尾时给会话命名。 */
     sessionRenamer = null;
+    /** 场景切换代理：由外层把「该会话」的场景落盘并广播；null = 当前环境不支持运行时切换。 */
+    sceneApplier = null;
+    /** 场景解析代理：按会话 id 取生效场景（外层读会话元数据）；null = 回落全局设置。 */
+    sceneResolver = null;
+    /** 历史检索回调：由外层注入（SessionStore.search），供模型跨会话检索历史对话做对比。 */
+    sessionSearcher = null;
     /** 后台命令任务（background / wait_ms 转后台），键为 exec-N。 */
     jobs = new Map();
     jobSeq = 0;
@@ -274,6 +360,10 @@ export class ToolExecutor {
     /** 注册会话改名回调；返回最终标题，会话不存在时返回 null。 */
     setSessionRenamer(fn) {
         this.sessionRenamer = fn;
+    }
+    /** 注册历史检索回调（只读）；供 search_sessions 工具跨会话检索对话。 */
+    setSessionSearcher(fn) {
+        this.sessionSearcher = fn;
     }
     /** 覆盖本会话的授权白名单。 */
     setGrants(paths) {
@@ -394,7 +484,7 @@ export class ToolExecutor {
     clearWindow() {
         this.targetInfo = null;
     }
-    runtimeContext(notesLength) {
+    runtimeContext(notesLength, sessionId) {
         const s = this.settings;
         const lines = [];
         lines.push('- 当前会话: ' + (this.session.title || '(未命名)') + '（各会话的工作记录与笔记互相隔离）');
@@ -407,6 +497,15 @@ export class ToolExecutor {
             ? '- 全局技巧库: 已启用（跨会话共享，' + tipStats.count + ' 条 / ' + tipStats.chars + '/' + tipStats.max +
                 ' 字符；已附在本请求末尾）'
             : '- 全局技巧库: 用户已在设置中关闭，本次请求不附带（仍可用 global_tips 读写，但内容不会注入提示词）');
+        // 工具场景：默认档/关闭时不编造场景提示，只告知可以切换
+        const sceneCfg = this.sceneFor(sessionId);
+        if (sceneCfg.sceneGuideEnabled && sceneCfg.toolScene !== 'general') {
+            const scene = getScene(sceneCfg.toolScene);
+            lines.push('- 工具场景: ' + scene.label + '（' + scene.id + '）——本次请求已按该场景注入工具指引，并按场景增强了工具描述。任务性质变了就调用 set_scene 切换，别用本场景的套路硬凑。');
+        }
+        else {
+            lines.push('- 工具场景: 通用（未注入任何场景指引）。若这次任务明显属于程序开发 / 科研 / 对话 / 游戏操作 / PPT 处理 / 网络安全维护，先调用 set_scene 切过去，能拿到该场景的工具链提示。');
+        }
         if (s.gameSavePath)
             lines.push('- 用户提供的存档路径提示: ' + s.gameSavePath);
         if (!this.native.available) {
@@ -433,7 +532,7 @@ export class ToolExecutor {
             ? '- 运行模式：持续托管。完成一轮后会自动继续。'
             : '- 运行模式：单轮任务。完成用户本次要求后立即输出最终答复并停止；不要再调用工具、不要自行继续观察。');
         lines.push('- 中断由用户在网页上点击“中断运行”，你不需要也不应该模拟它。');
-        lines.push('- 通用工具：exec_command（PowerShell 命令；支持 background / wait_ms 后台运行）、exec_output / exec_kill（取后台输出、终止任务）、read_file / list_directory / find_files / search_files（只读）、write_file / edit_file / apply_patch（仅工作空间可写）、web_fetch、clipboard_read / clipboard_write、process_list、view_image、launch_app、wait。');
+        lines.push('- 通用工具：exec_command（' + (process.platform === 'win32' ? 'PowerShell' : '/bin/sh -lc') + ' 命令；支持 background / wait_ms 后台运行）、exec_output / exec_kill（取后台输出、终止任务）、read_file / list_directory / find_files / search_files（只读）、write_file / edit_file / apply_patch（仅工作空间可写）、web_fetch、clipboard_read / clipboard_write、process_list、view_image、launch_app、wait。');
         lines.push(s.allowShell
             ? '- shell 已启用：exec_command 默认在工作空间执行，单条超时 ' + Math.round(s.shellTimeoutMs / 1000) + ' 秒。'
             : '- shell 已禁用：不要调用 exec_command。');
@@ -476,12 +575,20 @@ export class ToolExecutor {
     setPluginAuditor(fn) {
         this.pluginAuditor = fn;
     }
+    /** 注册场景切换代理（外层按会话落盘并广播）。 */
+    setSceneApplier(fn) {
+        this.sceneApplier = fn;
+    }
+    /** 注册场景解析代理（按会话 id 取生效场景）。 */
+    setSceneResolver(fn) {
+        this.sceneResolver = fn;
+    }
     /**
      * 工具清单 = 核心工具 + 插件工具。
      * 插件关闭或出任何异常时都回退成纯核心清单：核心永远不因插件而少一个工具。
      */
-    catalog() {
-        const core = buildToolCatalog();
+    catalog(sessionId) {
+        const core = this.enrichForScene(buildToolCatalog(), sessionId);
         try {
             if (!this.settings.pluginsEnabled || !this.plugins)
                 return core;
@@ -490,6 +597,49 @@ export class ToolExecutor {
         }
         catch {
             return core;
+        }
+    }
+    /**
+     * 按当前工具场景增强工具描述（在原描述后追加一句场景专用提示）。
+     * 默认档（general）或用户关闭场景指引时**原样返回**，保证与没有该功能时逐字一致。
+     */
+    enrichForScene(tools, sessionId) {
+        const s = this.sceneFor(sessionId);
+        if (!s.sceneGuideEnabled || s.toolScene === 'general')
+            return tools;
+        let changed = false;
+        const out = tools.map((t) => {
+            const base = t.function.description;
+            const next = enhanceToolDescription(s.toolScene, t.function.name, base);
+            if (next === base)
+                return t;
+            changed = true;
+            return { type: t.type, function: { ...t.function, description: next } };
+        });
+        return changed ? out : tools;
+    }
+    /** 当前场景的提示词块（拼在动态 system 消息最前面；关闭或默认档返回空串）。 */
+    scenePromptBlock(sessionId) {
+        const s = this.sceneFor(sessionId);
+        return sceneGuideBlock(s.toolScene, s.sceneGuideEnabled);
+    }
+    /**
+     * 生效场景：会话级优先（由 resolver 读会话元数据），未注入 resolver 或解析失败时回落全局设置。
+     * 按 sessionId 解析而不读 this.session：工具执行器是单例，多会话并行时 this.session 只是「最近绑定」的那个。
+     */
+    sceneFor(sessionId) {
+        const base = { toolScene: this.settings.toolScene, sceneGuideEnabled: this.settings.sceneGuideEnabled };
+        const id = sessionId || this.session.id;
+        if (!this.sceneResolver || !id)
+            return base;
+        try {
+            const r = this.sceneResolver(id);
+            if (!isSceneId(r.toolScene))
+                return base;
+            return { toolScene: r.toolScene, sceneGuideEnabled: !!r.sceneGuideEnabled };
+        }
+        catch {
+            return base;
         }
     }
     async execute(name, argsJson, signal) {
@@ -529,7 +679,9 @@ export class ToolExecutor {
                 case 'append_work_notes': return this.appendNotes(args);
                 case 'read_work_notes': return this.readNotes();
                 case 'rename_session': return this.renameSessionTool(args);
+                case 'search_sessions': return this.searchSessionsTool(args);
                 case 'global_tips': return this.globalTipsTool(args);
+                case 'set_scene': return this.setSceneTool(args);
                 // 兼容旧会话历史里的工具名
                 case 'update_game_record': return this.updateRecord(args);
                 case 'read_game_record': return this.readRecord();
@@ -930,25 +1082,68 @@ export class ToolExecutor {
         if (stat.isDirectory())
             return err('这是一个目录，请用 list_directory: ' + p);
         const asBase64 = asBool(args.as_base64, false);
-        const max = Math.min(1024 * 1024, Math.max(1024, asInt(args.max_bytes, 262144)));
-        if (stat.size > max && !asBase64) {
-            return err('文件大小 ' + stat.size + ' 字节，超过 max_bytes=' + max + '。可提高 max_bytes 或使用 as_base64。');
-        }
-        const fd = fs.openSync(p, 'r');
+        const max = Math.min(READ_FILE_MAX_BYTES, Math.max(1024, asInt(args.max_bytes, 262144)));
+        // offset：从第 N 字节开始读（默认 0），配合 max_bytes 分段读大文件；不传时行为与旧版逐字一致
+        const offset = Math.min(Math.max(0, asInt(args.offset, 0)), Math.max(0, stat.size));
+        // 超限时不再直接失败：先按窗口读一段，文本再裁到安全边界（UTF-8 字符完整 + 尽量行首），
+        // 并在末尾给「剩余字节 + 续读 offset」。一次调用就能拿到可用内容，下一次照提示即可读完。
         let buf;
         try {
-            const len = Math.min(stat.size, max);
-            buf = Buffer.alloc(len);
-            fs.readSync(fd, buf, 0, len, 0);
+            const fd = fs.openSync(p, 'r');
+            try {
+                const len = Math.max(0, Math.min(stat.size - offset, max));
+                buf = Buffer.alloc(len);
+                if (len > 0)
+                    fs.readSync(fd, buf, 0, len, offset);
+            }
+            finally {
+                fs.closeSync(fd);
+            }
         }
-        finally {
-            fs.closeSync(fd);
+        catch (e) {
+            // 大文件更常见的失败是「被占用 / 权限不足 / 网络盘断开」：给出可执行替代方案，避免同参数死重试
+            const code = e && typeof e === 'object' && 'code' in e ? String(e.code || '') : '';
+            const hint = code === 'EBUSY' || code === 'EPERM' || code === 'EACCES'
+                ? '；文件可能被其它进程占用或权限不足，可用 exec_command 复制副本后再读，或用 search_files 直接检索片段。'
+                : code === 'EISDIR' ? '；目标不是普通文件。' : '；可换 offset/max_bytes 重试，或先用 list_directory 确认路径。';
+            return err('读取失败：' + (e instanceof Error ? e.message : String(e)) + hint);
         }
-        if (asBase64 || looksBinary(buf)) {
+        const binary = asBase64 || looksBinary(buf);
+        if (!binary) {
+            // 文本：截断点先退到 UTF-8 字符边界，再尽量退到行首（回退量有上限，且至少保留一半内容）
+            const charEnd = safeTextEnd(buf);
+            let stop = charEnd;
+            if (charEnd > 0 && offset + charEnd < stat.size) {
+                const nl = buf.lastIndexOf(0x0a, charEnd - 1);
+                if (nl >= 0 && charEnd - (nl + 1) <= READ_LINE_ALIGN_SLACK && nl + 1 >= Math.floor(charEnd / 2))
+                    stop = nl + 1;
+            }
+            if (stop > 0 && stop < buf.length)
+                buf = buf.subarray(0, stop);
+        }
+        const nextOffset = offset + buf.length;
+        const remain = Math.max(0, stat.size - nextOffset);
+        const truncated = remain > 0;
+        if (binary) {
+            const tail = truncated
+                ? '\n\n[已截断] 本次读取 offset ' + offset + ' 起的 ' + buf.length + ' 字节，还剩 ' + remain +
+                    ' 字节。续读请再调用 read_file 并传 offset=' + nextOffset + '（或提高 max_bytes，上限 ' + READ_FILE_MAX_BYTES + '）。'
+                : '';
             return ok('文件 ' + p + '（' + stat.size + ' 字节，已返回 Base64，截断到 ' + buf.length + ' 字节）:\n' +
-                buf.toString('base64'), path.basename(p) + ' · Base64');
+                buf.toString('base64') + tail, path.basename(p) + ' · Base64' + (truncated ? ' · 剩余 ' + remain + ' 字节' : ''));
         }
-        return ok('文件 ' + p + '（' + stat.size + ' 字节）:\n' + buf.toString('utf8'), path.basename(p) + ' · ' + stat.size + ' 字节');
+        const rangeNote = offset > 0 ? '，从第 ' + offset + ' 字节起，本次返回 ' + buf.length + ' 字节' : '';
+        // 本页最后一行被劈开时提醒一句，模型下次就不会把半行当完整行
+        const brokenLine = truncated && buf.length > 0 && buf[buf.length - 1] !== 0x0a;
+        const tail = truncated
+            ? '\n\n[已截断] 本次返回第 ' + offset + '–' + nextOffset + ' 字节（文件共 ' + stat.size + ' 字节），还剩 ' + remain +
+                ' 字节。继续读请再调用 read_file 并传 offset=' + nextOffset + ' 与相同的 path' +
+                (brokenLine ? '；本页最后一行可能不完整，续读会从该行剩余部分开始。' : '。')
+            : (!truncated && buf.length === 0 && offset > 0
+                ? '\n\n[已到末尾] offset=' + offset + ' 已到或已越过文件末尾（共 ' + stat.size + ' 字节），本次没有内容可读；从头读请传 offset=0。'
+                : '');
+        const detailBytes = truncated ? buf.length + '/' + stat.size : (offset > 0 ? buf.length : stat.size);
+        return ok('文件 ' + p + '（' + stat.size + ' 字节' + rangeNote + '）:\n' + buf.toString('utf8') + tail, path.basename(p) + ' · ' + detailBytes + ' 字节');
     }
     listDirectory(args) {
         const p = normalizePath(asString(args.path) || this.settings.workspacePath);
@@ -1120,6 +1315,55 @@ export class ToolExecutor {
         this.session.title = applied;
         return ok('会话已命名为「' + applied + '」。', '命名 ' + applied);
     }
+    /**
+     * 跨会话检索历史对话（只读）：让模型能翻看过往会话里怎么做的，用于对比。
+     * 关键词按空格拆分、需全部命中；scope='all' 时连同工具产物与工作记录/笔记一起搜。
+     */
+    searchSessionsTool(args) {
+        if (!this.sessionSearcher)
+            return err('当前环境不支持历史检索。');
+        const query = (asString(args.query) ?? '').trim();
+        if (!query)
+            return err('query 不能为空：请给出要检索的关键词，多个关键词用空格分隔（需同时命中）。');
+        const scope = (asString(args.scope) || '').trim().toLowerCase() === 'all' ? 'all' : 'chat';
+        const limit = asInt(args.limit, 8);
+        let report;
+        try {
+            report = this.sessionSearcher(query, {
+                scope,
+                maxGroups: Math.min(20, Math.max(1, limit)),
+                maxPerSession: 3,
+            });
+        }
+        catch (e) {
+            return err('历史检索失败：' + (e instanceof Error ? e.message : String(e)));
+        }
+        if (report.groups.length === 0) {
+            return ok('没有历史会话命中「' + query + '」（已扫描 ' + report.scanned + ' 个会话，范围 ' + scope + '）。' +
+                (scope === 'chat' ? '可以试 scope=all 把工具输出与工作记录/笔记也纳入检索。' : ''), '历史检索：无命中');
+        }
+        // 面向模型的文本：每条命中给「会话标题 + 时间 + 来源 + 片段」，便于直接对比
+        const lines = [];
+        lines.push('历史检索「' + query + '」命中 ' + report.groups.length + ' 个会话 / 共 ' + report.totalHits +
+            ' 条（范围 ' + scope + '，已扫描 ' + report.scanned + ' 个会话' + (report.truncated ? '，结果已截断' : '') + '）：');
+        report.groups.forEach((g, gi) => {
+            const at = new Date(g.updatedAt);
+            const when = (at.getMonth() + 1) + '-' + at.getDate() + ' ' +
+                String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0');
+            lines.push('');
+            lines.push((gi + 1) + '. 《' + g.title + '》' + (when ? '（' + when + '更新）' : '') + ' 命中 ' + g.hitCount + ' 条');
+            for (const h of g.hits) {
+                const tag = h.kind === 'session-title' ? '标题' : h.kind;
+                lines.push('   - [' + tag + (h.time ? ' ' + h.time : '') + '] ' + h.snippet);
+            }
+            if (g.hitCount > g.hits.length)
+                lines.push('   - ……另有 ' + (g.hitCount - g.hits.length) + ' 条命中未列出');
+        });
+        lines.push('');
+        lines.push('提示：这是只读检索，未改动任何会话。要对比细节时，可再用 read_file 打开该会话的记录' +
+            '（<工作空间>/sessions/<会话id>/）或让用户切换会话。');
+        return ok(lines.join('\n'), '历史检索 ' + report.groups.length + ' 个会话');
+    }
     readNotes() {
         const md = this.notes.read();
         return ok('当前工作笔记（' + md.length + '/' + NOTES_MAX_CHARS + ' 字符）：\n' + md, '读取工作笔记');
@@ -1131,6 +1375,32 @@ export class ToolExecutor {
      * 全局技巧库（跨会话共享）：add / use / list / remove。
      * add 会强制脱敏；内容涉及项目信息时直接拒绝，不静默写入。
      */
+    /**
+     * 场景切换工具：只改设置里的 toolScene，由外层落盘并广播。
+     * 有 resolver 时会话级场景已落盘，本轮后续解析会立刻读到新值；无 resolver 时同步 this.settings。
+     */
+    setSceneTool(args) {
+        const sceneCfg = this.sceneFor();
+        const current = getScene(sceneCfg.toolScene);
+        const options = SCENES.map((x) => x.id + '=' + x.label).join('、');
+        const raw = (asString(args.scene) || '').trim().toLowerCase();
+        if (!raw) {
+            const state = sceneCfg.sceneGuideEnabled ? '已开启（会注入指引）' : '已在设置里关闭（只切档位、不注入指引）';
+            return ok('当前工具场景: ' + current.label + '（' + current.id + '）；场景指引' + state + '\n可选场景: ' + options, '工具场景 · ' + current.label);
+        }
+        if (!isSceneId(raw))
+            return err('未知场景 ' + raw + '。可选: ' + options);
+        if (!this.sceneApplier)
+            return err('当前环境不支持切换工具场景（未注册 setSceneApplier）。请到网页设置面板「工具场景」里切换。');
+        const applied = this.sceneApplier(this.session.id, raw);
+        if (!isSceneId(applied))
+            return err('切换工具场景失败：外部设置未接受 ' + raw + '。');
+        // 有 resolver 时会话级场景已落盘，全局设置保持不动；无 resolver 时保留旧的全局覆盖行为
+        if (!this.sceneResolver)
+            this.settings = { ...this.settings, toolScene: applied };
+        const next = getScene(applied);
+        return ok('已切换到工具场景「' + next.label + '」（' + next.id + '）：下一轮请求起按该场景注入工具指引，并按场景增强工具描述。\n' + next.tagline, '工具场景 → ' + next.label);
+    }
     globalTipsTool(args) {
         const action = (asString(args.action) || 'list').trim().toLowerCase();
         const stats = this.tips.stats();
@@ -1310,7 +1580,10 @@ export class ToolExecutor {
     /** 同步结束的常规输出（与旧版一致）。 */
     foregroundResult(res, cwd) {
         const parts = [];
-        parts.push('退出码: ' + res.code + (res.timedOut ? '（已超时并终止）' : ''));
+        parts.push('退出码: ' +
+            res.code +
+            (res.timedOut ? '（已超时并终止）' : '') +
+            (res.forced ? '（输出管道未关闭，已强制结算）' : ''));
         parts.push('工作目录: ' + cwd);
         if (res.stdout.trim())
             parts.push('--- stdout ---\n' + truncate(res.stdout.trim(), 200_000));
@@ -1906,9 +2179,10 @@ export function buildToolCatalog() {
             width: I('区域宽'), height: I('区域高'),
             language: S('OCR 语言，如 zh-Hans、en-US'),
         }),
-        tool('read_file', '读取本机任意文件（只读）。文本返回内容；二进制/存档可设 as_base64=true 读取原始字节。', {
+        tool('read_file', '读取本机任意文件（只读）。文本返回内容；单次最多 max_bytes 字节（默认 262144，上限 1048576），超出时返回前一段并在末尾给出剩余字节与续读用的 offset，按提示继续调用即可读完大文件；二进制/存档可设 as_base64=true 读取原始字节。', {
             path: S('文件绝对路径'),
-            max_bytes: I('最大读取字节数，默认 262144'),
+            max_bytes: I('单次最多读取字节数，默认 262144，上限 1048576'),
+            offset: I('起始字节偏移，默认 0；大文件按上次返回的 offset 续读'),
             as_base64: B('是否以 Base64 返回'),
         }, ['path']),
         tool('list_directory', '列出目录内容（只读，可访问任意目录）。', {
@@ -1927,7 +2201,7 @@ export function buildToolCatalog() {
         tool('delete_path', '删除工作空间内的文件/目录（移入工作空间 .trash 回收站）。', {
             path: S('工作空间内的绝对路径'),
         }, ['path']),
-        tool('update_work_record', '整份覆盖更新工作记录 Markdown。必须包含：任务目标、当前进度、关键环境、已改动文件、待办、决策与风险。不要追加历史，只写当前最新状态。', {
+        tool('update_work_record', '整份覆盖更新工作记录 Markdown。必须包含：任务目标、任务计划、当前进度、关键环境、已改动文件、待办、决策与风险。任务开头先写「任务计划」（`- [ ] P1 …` 步骤清单），之后每完成一步把该步改成 `- [x]` 并同步当前进度。不要追加历史，只写当前最新状态。', {
             content: S('完整的新 Markdown 内容（整份替换旧文件）'),
         }, ['content']),
         tool('read_work_record', '读取当前工作记录 Markdown。', {}),
@@ -1941,6 +2215,11 @@ export function buildToolCatalog() {
         tool('rename_session', '给当前会话起一个简短名称（6~16 字，概括这次任务，不带标点/日期）。在任务收尾、输出 [[DONE]] 之前调用一次；新建会话不再向用户索要标题，命名由你负责。', {
             title: S('新的会话名称，例如 修复命令行后台执行'),
         }, ['title']),
+        tool('search_sessions', '跨会话检索历史对话（只读，不改动任何数据）：用于翻看过往会话里是怎么做的、做对比。关键词按空格拆分，需**全部命中**才计入；大小写不敏感、中文按子串匹配。scope=chat（默认）只搜会话标题与对话正文，scope=all 时连工具输出与工作记录/笔记一起搜（适合查「当时到底跑了什么命令」）。返回按会话分组，每组带命中片段。', {
+            query: S('检索关键词，多个词用空格分隔（AND 语义），例如 构建 失败'),
+            scope: { type: 'string', enum: ['chat', 'all'], description: 'chat=标题+对话正文（默认）；all=再加工具产物与工作记录/笔记' },
+            limit: I('最多返回多少个会话分组，默认 8，最大 20'),
+        }, ['query']),
         tool('global_tips', '全局技巧库（跨会话共享的长期工具技巧）：action=add 写入（自动脱敏，含项目/路径/密钥等专有信息会被拒绝）、use 记录一次利用频次、list 查看、remove 删除。只写通用工具技巧，不写项目信息。容量超限时按利用频次从低到高自动清除。', {
             action: { type: 'string', enum: ['add', 'use', 'list', 'remove'], description: '要执行的操作' },
             text: S('add 时的技巧正文（一两句话，只含通用工具经验）'),
@@ -1948,11 +2227,14 @@ export function buildToolCatalog() {
             ids: { type: 'array', items: { type: 'string' }, description: 'use 时批量传入的条目 id 列表' },
             times: I('use 时累加的频次，默认 1'),
         }, ['action']),
+        tool('set_scene', '切换工具场景：不同场景注入不同的工具用法指引（推荐工具链 / 操作要点 / 常见失效），并按场景增强工具描述。任务性质变化时调用一次即可；不传 scene 时返回当前场景与可选值。', {
+            scene: { type: 'string', enum: SCENES.map((x) => x.id), description: '场景 id（' + SCENES.map((x) => x.id + '=' + x.label).join('、') + '）' },
+        }),
         tool('get_environment', '获取工作空间、记录路径、存档提示、屏幕尺寸与目标窗口信息。', {}),
         tool('wait', '等待指定毫秒（最多 10 秒），用于等界面加载、动画或任务完成。', {
             ms: I('毫秒，0-10000'),
         }, ['ms']),
-        tool('exec_command', '在工作空间（或指定目录）执行一条命令，默认 Windows PowerShell，其他平台 /bin/sh。默认同步等待，返回退出码 + stdout + stderr。长任务建议不要死等：background=true 立即拿回任务 ID，或用 wait_ms 限时等待（到期自动转后台且不中断执行），随后用 exec_output 取增量输出、exec_kill 终止。', {
+        tool('exec_command', '在工作空间（或指定目录）执行一条命令：Windows 用 PowerShell，Linux/macOS 用 /bin/sh -lc（bash 语法可写，PowerShell 语法不可用）。默认同步等待，返回退出码 + stdout + stderr。长任务建议不要死等：background=true 立即拿回任务 ID，或用 wait_ms 限时等待（到期自动转后台且不中断执行），随后用 exec_output 取增量输出、exec_kill 终止。', {
             command: S('要执行的命令，例如 npm run build 或 Get-ChildItem'),
             cwd: S('工作目录（默认工作空间）'),
             timeout_ms: I('超时毫秒，默认取设置里的 shell 超时（后台任务默认至少 10 分钟，上限 30 分钟）'),

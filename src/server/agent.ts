@@ -1,12 +1,13 @@
 import type { Attachment, ChatItem, ChatItemKind, ChatMessage, TargetWindow } from '../shared/types.js';
 import type { ServerEvent } from '../shared/types.js';
-import type { ServerSettings } from './settings.js';
+import { resolveModelSettings, type ServerSettings } from './settings.js';
 import { DONE_TOKEN, STATIC_SYSTEM_PROMPT } from '../shared/prompt.js';
 import { streamChat } from './llm.js';
 import type { ToolExecutor } from './tools.js';
 import { putImage } from './imagestore.js';
 import { trimHistoryMessages } from './history.js';
 import { RepeatGuard, REPEAT_LIMIT, REPEAT_WINDOW } from './repeat-guard.js';
+import { planNudge } from './record.js';
 import { splitInputTokens } from '../shared/pricing.js';
 import { timeLabel } from './paths.js';
 
@@ -74,10 +75,21 @@ export class AgentRunner {
   private running = false;
   private status = '空闲';
   private recordUpdatedInCycle = false;
+  /**
+   * 任务首轮保留：本轮任务中「第一轮」的轮号（`turn` 值）。等于该值的轮次
+   * 产生的所有消息会打上 pinned 标记，历史裁剪时强制保留；任务结束（[[DONE]]）
+   * 或下一个任务开始时解除。0 表示当前没有钉住的轮次。
+   */
+  private pinnedTurn = 0;
   private runSeq = 0;
   /** 待合并的流式 patch（按 item id 合并，保留最新的完整文本）。 */
   private pendingPatches = new Map<string, Partial<ChatItem>>();
   private flushTimer: NodeJS.Timeout | null = null;
+  /**
+   * 运行中用户插入的消息：立即进时间线，但历史要等本轮结束后的「轮次边界」才并入，
+   * 否则会把 assistant.tool_calls 与对应 tool 结果拆散，下一轮请求会被服务端判为非法序列。
+   */
+  private pendingInjected: Array<{ content: string; images: string[] | null }> = [];
 
   constructor(
     private readonly deps: AgentDeps,
@@ -205,10 +217,12 @@ export class AgentRunner {
     }
     this.history = [];
     this.turn = 0;
+    this.pinnedTurn = 0;
     this.promptTokens = 0;
     this.completionTokens = 0;
     this.cachedTokens = 0;
     this.lastPromptTokens = 0;
+    this.pendingInjected = [];
     this.timeline.clear();
     this.deps.emit({ type: 'clear', sessionId: this.deps.sessionId });
     this.setState(false, '空闲');
@@ -221,6 +235,58 @@ export class AgentRunner {
     } catch {
       /* ignore */
     }
+  }
+
+  /**
+   * 运行中插入一条用户消息（不打断当前轮）：立即进时间线，排队到本轮结束后的
+   * 轮次边界并入 history，因此在**下一轮请求**里生效。
+   * 返回 ok=false 表示当前没在运行（调用方应改走 start）。
+   */
+  injectUserMessage(text: string, attachments: Attachment[] = []): { ok: boolean; reason?: string } {
+    if (!this.running) return { ok: false, reason: 'not-running' };
+    const prompt = typeof text === 'string' ? text.trim() : '';
+    if (!prompt && attachments.length === 0) return { ok: false, reason: 'empty' };
+
+    const imageAttachments = attachments.filter((a) => a.kind === 'image' && !!a.dataUrl);
+    const textAttachments = attachments.filter((a) => a.kind === 'text' && !!a.text);
+    const imageB64 = imageAttachments
+      .map((a) => String(a.dataUrl).replace(/^data:[^;]+;base64,/, ''))
+      .filter((b64) => b64.length > 0);
+    const textBlocks = textAttachments.map((a) =>
+      '\n\n===== 附件: ' + a.name + ' =====\n' + (a.text || '').slice(0, 60_000));
+    const userContent = textBlocks.length > 0 ? prompt + textBlocks.join('') : prompt;
+
+    this.pendingInjected.push({
+      content: userContent,
+      images: imageB64.length > 0 ? imageB64 : null,
+    });
+
+    const attachmentMeta: Attachment[] = attachments.map((a) => ({
+      name: a.name,
+      mime: a.mime,
+      size: a.size,
+      kind: a.kind,
+      ...(a.kind === 'image' && a.dataUrl
+        ? { imageId: putImage(String(a.dataUrl).replace(/^data:[^;]+;base64,/, '')) }
+        : {}),
+    }));
+    const firstImage = attachmentMeta.find((a) => a.imageId);
+    this.pushItem('user', prompt || '（仅附件）', {
+      attachments: attachmentMeta.length > 0 ? attachmentMeta : null,
+      imageUrl: firstImage?.imageId ? '/api/images/' + firstImage.imageId : null,
+    });
+    this.persist();
+    return { ok: true };
+  }
+
+  /** 把排队中的插入消息并入历史（只在轮次边界调用，绝不拆散工具组）。返回并入条数。 */
+  private drainInjected(): number {
+    if (this.pendingInjected.length === 0) return 0;
+    const list = this.pendingInjected.splice(0, this.pendingInjected.length);
+    for (const m of list) {
+      this.history.push({ role: 'user', content: m.content, images: m.images });
+    }
+    return list.length;
   }
 
   async start(
@@ -253,6 +319,13 @@ export class AgentRunner {
       '\n\n===== 附件: ' + a.name + ' =====\n' + (a.text || '').slice(0, 60_000));
     const userContent = textBlocks.length > 0 ? userPrompt + textBlocks.join('') : userPrompt;
 
+    // 新任务开始：先解除上一个任务的首轮保留（上一个任务已结束或被打断），
+    // 再裁剪历史（否则旧首轮会被强制留下，白白占预算）。
+    for (const m of this.history) {
+      if (m.pinned) delete m.pinned;
+    }
+    this.pinnedTurn = 0;
+
     // 非连续模式下历史也会一直增长：新一轮开始前按同一套规则裁剪（裁剪点不拆工具组）
     this.trimHistory(settings);
 
@@ -260,7 +333,10 @@ export class AgentRunner {
       role: 'user',
       content: userContent,
       images: imageB64.length > 0 ? imageB64 : null,
+      pinned: true,
     });
+    // 首轮 = 接下来跑的第一轮；该轮内产生的 assistant / tool 结果一并钉住
+    this.pinnedTurn = this.turn + 1;
 
     const attachmentMeta: Attachment[] = attachments.map((a) => ({
       name: a.name,
@@ -286,17 +362,39 @@ export class AgentRunner {
     // 重复工具调用熔断：同一调用在最近 REPEAT_WINDOW 次里出现 REPEAT_LIMIT 次后，再一次就中断本轮
     const repeatGuard = new RepeatGuard();
 
+    // 首次规划守卫：工作记录里还没有可用的「## 任务计划」（或计划已全部勾选）时，
+    // 主动提醒模型先把计划写进工作记录再动手——提示词是软约束，这里是最低限度的硬提醒。
+    const planHint = planNudge(this.deps.tools.record.read());
+    if (planHint) {
+      this.history.push({ role: 'user', content: planHint, pinned: true });
+      this.pushItem('system', '提醒模型先规划任务：请把步骤写进工作记录的「## 任务计划」');
+      this.persist();
+    }
+
     try {
       while (!signal.aborted) {
         if (myRun !== this.runSeq) break;
+        // 运行中插入的用户消息：只在这里（轮次边界）并入历史，
+        // 保证不把 assistant.tool_calls 与对应 tool 结果拆散。
+        this.drainInjected();
         if (settings.maxTurns > 0 && this.turn >= settings.maxTurns) {
           this.pushItem('system', '已达到最大轮数，停止。');
           this.setState(false, '已达到最大轮数');
           break;
         }
 
+        // 每轮开始前先裁一次：工具调用 / 工作记录提醒分支会提前 continue，
+        // 只在「续跑分支」裁剪的话，工具密集的轮次永远不会裁，历史会线性膨胀。
+        this.trimHistory(settings);
+
         this.turn++;
         this.setState(true, '运行中 · 第 ' + this.turn + ' 轮');
+        // 本轮是否属于任务首轮：其产出的消息要钉住，不被后续裁剪淘汰
+        const pinThisTurn = this.pinnedTurn > 0 && this.turn === this.pinnedTurn;
+
+        // 多模型：每轮重新解析「当前选中的模型配置」，所以在对话框里切换后下一轮即生效，
+        // 不会打断正在生成的这一轮。未启用多模型时原样返回全局设置。
+        const turnSettings = resolveModelSettings(this.deps.getSettings());
 
         let assistantText = '';
         let reasoningText = '';
@@ -312,10 +410,10 @@ export class AgentRunner {
         let thinkingItem: ChatItem | null = null;
         /** 本轮是否用过「预估」的缓存命中数（服务商未上报时） */
         let cachedEstimated = false;
-        const request = this.buildRequestMessages(settings);
+        const request = this.buildRequestMessages(turnSettings);
 
         try {
-          for await (const ev of streamChat(settings, request, this.deps.tools.catalog(), signal)) {
+          for await (const ev of streamChat(turnSettings, request, this.deps.tools.catalog(this.deps.sessionId), signal)) {
             if (ev.type === 'text') {
               assistantText += ev.text;
               this.patchItem(textItem.id, { text: assistantText, streaming: true }, true);
@@ -403,6 +501,7 @@ export class AgentRunner {
             content: assistantText,
             reasoning: reasoningText || null,
             toolCalls: list.map((c) => ({ ...c })),
+            ...(pinThisTurn ? { pinned: true } : {}),
           });
 
           // 每个 tool_call 必须有且只有一条结果消息。中断/异常退出时也要补齐占位结果，
@@ -440,6 +539,7 @@ export class AgentRunner {
                 toolCallId: call.id,
                 content: result.text,
                 images: result.images ?? null,
+                ...(pinThisTurn ? { pinned: true } : {}),
               });
               answered.add(call.id);
               this.patchItem(toolItem.id, {
@@ -470,6 +570,7 @@ export class AgentRunner {
                 toolCallId: call.id,
                 content: '[工具调用已中断，未执行]',
                 images: null,
+                ...(pinThisTurn ? { pinned: true } : {}),
               });
             }
           }
@@ -487,9 +588,26 @@ export class AgentRunner {
           continue;
         }
 
-        this.history.push({ role: 'assistant', content: assistantText, reasoning: reasoningText || null });
+        this.history.push({
+          role: 'assistant',
+          content: assistantText,
+          reasoning: reasoningText || null,
+          ...(pinThisTurn ? { pinned: true } : {}),
+        });
+
+        // 本轮模型已给出完成标记，但用户刚刚插入了新消息：任务不该结束，继续跑（消息在下轮轮首并入）
+        if (completion.done && this.pendingInjected.length > 0) {
+          this.pushItem('system', '检测到运行中插入的新消息，任务继续执行。');
+          this.persist();
+          continue;
+        }
 
         if (completion.done) {
+          // 任务结束：解除首轮保留（下一个任务会重新按新首轮计算）
+          for (const m of this.history) {
+            if (m.pinned) delete m.pinned;
+          }
+          this.pinnedTurn = 0;
           // 任务彻底结束：清空改动前备份，避免临时备份长期堆积（失败不影响收尾）
           try {
             this.deps.tools.backups.clear(this.deps.sessionId);
@@ -515,6 +633,8 @@ export class AgentRunner {
         nudges = 0;
 
         if (!settings.continuousMode) {
+          // 单轮模式：若用户刚插入了消息，这一轮不能收工
+          if (this.pendingInjected.length > 0) continue;
           this.setState(false, '本轮完成');
           this.persist();
           break;
@@ -543,6 +663,8 @@ export class AgentRunner {
       }
     } finally {
       this.flushPatches();
+      // 运行结束时仍未并入的插入消息也要落进历史，避免用户输入丢失
+      this.drainInjected();
       if (myRun === this.runSeq) {
         this.running = false;
         this.controller = null;
@@ -561,18 +683,30 @@ export class AgentRunner {
   }
 
   private buildRequestMessages(settings: ServerSettings): ChatMessage[] {
-    const list: ChatMessage[] = [{ role: 'system', content: STATIC_SYSTEM_PROMPT }];
-    list.push(...this.history);
     // 每轮只读一次工作记录与笔记：runtimeContext / buildPromptBlock 复用这两次读到的内容
     const recordMd = this.deps.tools.record.ensureExists();
     const notesMd = this.deps.tools.notes.ensureExists();
-    const runtime = this.deps.tools.runtimeContext(notesMd.length);
+    const runtime = this.deps.tools.runtimeContext(notesMd.length, this.deps.sessionId);
     // 全局技巧库：用户关闭后返回空串，提示词不再附加（内容保留在库里）
     const tipsBlock = this.deps.tools.tips.buildPromptBlock(settings.globalTipsEnabled);
+    // 工具场景：默认档/关闭时返回空串 → 提示词与没有该功能时逐字一致
+    const sceneBlock = this.deps.tools.scenePromptBlock(this.deps.sessionId);
+
+    // 顺序按「稳定度」从高到低排，前缀缓存才可能命中更长的一段：
+    //   1) 静态系统提示：永不改变
+    //   2) 笔记 + 工具场景：只在写笔记 / 切场景时变，体积大，必须排在历史之前
+    //   3) 对话历史：只在末尾追加
+    //   4) 工作记录 + 运行上下文 + 技巧库：每轮都变，只能放最末尾
+    // 动态块若排在历史之后，历史每轮增长会把它的起点一路后推，
+    // 于是哪怕内容一字未改，也永远不可能是任何一次请求的前缀 → 每次都按「未命中」计费。
+    const list: ChatMessage[] = [{ role: 'system', content: STATIC_SYSTEM_PROMPT }];
+    // 笔记在前、场景在后：笔记变更时后面的内容本就要重算，而切场景不必连带作废整份笔记
+    const stableBlock = this.deps.tools.notes.buildPromptBlock(notesMd) + (sceneBlock ? '\n' + sceneBlock : '');
+    list.push({ role: 'system', content: stableBlock });
+    list.push(...this.history);
     list.push({
       role: 'system',
-      content: this.deps.tools.record.buildPromptBlock(runtime, recordMd) + '\n' +
-        this.deps.tools.notes.buildPromptBlock(notesMd) + (tipsBlock ? '\n' + tipsBlock : ''),
+      content: this.deps.tools.record.buildPromptBlock(runtime, recordMd) + (tipsBlock ? '\n' + tipsBlock : ''),
     });
     return list;
   }

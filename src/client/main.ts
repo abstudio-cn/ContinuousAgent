@@ -1,5 +1,6 @@
-import type { AppState, ChatItem, PluginState, PublicSettings, ServerEvent, WindowInfo } from '../shared/types.js';
+import type { AppState, ChatItem, ModelProfile, PluginState, PublicSettings, ServerEvent, SessionSceneState, SessionSearchHit, SessionSearchReport, WindowInfo } from '../shared/types.js';
 import { computeCost, formatMoney, hasPricing, splitInputTokens, type PriceTable } from '../shared/pricing.js';
+import { getScene, sceneSelectOptions } from '../shared/scenes.js';
 import { MarkdownStream, renderMarkdown } from './markdown.js';
 import { TtsPlayer } from './tts.js';
 
@@ -45,14 +46,28 @@ function fmtNum(n: number): string {
 }
 
 // ---------------------------------------------------------------- 价格统计
-/** 从当前设置里取单价表（三项全 0 表示不计费）。 */
+/** 多模型里被选中的那套配置；未选中（用全局模型）或找不到时返回 null。 */
+function activeModelProfile(): ModelProfile | null {
+  const s = state?.settings;
+  if (!s || !s.activeModelId) return null;
+  return s.modelProfiles.find((m) => m.id === s.activeModelId) || null;
+}
+
+/** 三项单价：当前模型的覆盖优先，未覆盖则回落全局（与服务端 resolveModelSettings 同口径）。 */
 function priceTable(): PriceTable {
   const s = state?.settings;
+  const p = activeModelProfile();
   return {
-    cacheHit: Number(s?.priceCacheHit) || 0,
-    input: Number(s?.priceInput) || 0,
-    output: Number(s?.priceOutput) || 0,
+    cacheHit: Number(p?.priceCacheHit ?? s?.priceCacheHit) || 0,
+    input: Number(p?.priceInput ?? s?.priceInput) || 0,
+    output: Number(p?.priceOutput ?? s?.priceOutput) || 0,
   };
+}
+
+/** 货币符号同样「当前模型优先」，留空则用全局。 */
+function priceCurrency(): string {
+  const p = activeModelProfile();
+  return p?.priceCurrency || state?.settings.priceCurrency || '¥';
 }
 
 /** 把一条用量换算成金额文本；未配置单价则返回空串（界面不显示金额）。 */
@@ -60,7 +75,7 @@ function fmtCost(usage: { promptTokens: number; completionTokens: number; cached
   if (!usage || !state) return '';
   const prices = priceTable();
   if (!hasPricing(prices)) return '';
-  return formatMoney(computeCost(usage, prices).total, state.settings.priceCurrency || '¥');
+  return formatMoney(computeCost(usage, prices).total, priceCurrency());
 }
 
 /** 输入的两段后缀：命中时给出「命中 X / 未命中 Y」；无命中则返回空串（此时输入全为未命中）。 */
@@ -68,6 +83,40 @@ function cacheSplitSuffix(usage: { promptTokens: number; cachedTokens?: number |
   const s = splitInputTokens(usage);
   if (s.hitTokens <= 0) return '';
   return '（命中 ' + (estimated ? '≈' : '') + fmtNum(s.hitTokens) + ' / 未命中 ' + fmtNum(s.missTokens) + '）';
+}
+
+/**
+ * 渲染输入框旁的模型下拉。
+ * 只有配置了多模型时才显示；选项第一项是「默认」（用设置里的全局模型）。
+ * 服务端已经把每条配置的密钥剥成 hasApiKey，这里不会碰到密钥。
+ */
+function renderModelSelect(): void {
+  const ctl = document.getElementById('modelCtl') as HTMLElement | null;
+  const sel = document.getElementById('modelSelect') as HTMLSelectElement | null;
+  if (!ctl || !sel || !state) return;
+  const profiles = state.settings.modelProfiles || [];
+  if (profiles.length === 0) {
+    ctl.classList.add('hidden');
+    sel.innerHTML = '';
+    return;
+  }
+  ctl.classList.remove('hidden');
+  sel.innerHTML = '';
+
+  const fallback = document.createElement('option');
+  fallback.value = '';
+  fallback.textContent = '默认（' + (state.settings.model || '未设置') + '）';
+  sel.appendChild(fallback);
+
+  for (const p of profiles) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = (p.name || p.model) + ' · ' + p.model + (p.hasApiKey ? '' : '（无密钥）');
+    opt.title = [p.model, p.apiBaseUrl || state.settings.apiBaseUrl].filter(Boolean).join(' @ ');
+    sel.appendChild(opt);
+  }
+  // 服务端会把无效 id 回落成 ''，这里直接采用它的结果，界面不保留非法选中项
+  sel.value = profiles.some((p) => p.id === state!.settings.activeModelId) ? state.settings.activeModelId : '';
 }
 
 /** 一条用量的展示文本：入（命中 X / 未命中 Y）· 出 Z tokens。 */
@@ -202,9 +251,24 @@ document.addEventListener('click', (ev) => {
 });
 
 // ---------------------------------------------------------------- 时间线渲染
+/** 是否已添加过模型配置（没有时各处提示先去「设置 → 多模型」添加） */
+function hasModelConfigured(): boolean {
+  return (state?.settings.modelProfiles || []).length > 0;
+}
+
 function emptyHint(): HTMLElement {
   const box = el('div', 'empty-hint');
   box.appendChild(el('div', 'big', '\u{1F41B}'));
+  if (!hasModelConfigured()) {
+    box.appendChild(el('div', 'title', '还没有添加模型'));
+    box.appendChild(el('div', '',
+      '打开右上角「⚙ 设置」→「多模型」→「+ 添加模型」，填模型名、API 地址与密钥后即可开始对话。'));
+    const go = el('button', 'btn primary', '去添加模型') as HTMLButtonElement;
+    go.type = 'button';
+    go.addEventListener('click', () => openSettings());
+    box.appendChild(go);
+    return box;
+  }
   box.appendChild(el('div', 'title', '还没有对话'));
   box.appendChild(el('div', '', '描述任务后按 Enter 开始；需要操作界面时先选上方目标窗口。'));
   return box;
@@ -377,6 +441,18 @@ function systemItemText(text: string): string {
   return rest || '任务结束，已停止自动续跑。';
 }
 
+/**
+ * 这类 system 项只是运行时给模型/用户的过程信号：界面上不展示（历史时间线里的旧项一并隐藏）。
+ * 只按文案前缀判断，服务端数据保持原样，便于回归脚本核对时间线。
+ */
+const HIDDEN_SYSTEM_PREFIXES = ['提醒模型先规划任务', '已压缩较早的对话历史'];
+
+function isHiddenItem(item: ChatItem): boolean {
+  if (item.kind !== 'system') return false;
+  const text = String(item.text || '').trim();
+  return HIDDEN_SYSTEM_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
 function renderItem(item: ChatItem): HTMLElement {
   let node: HTMLElement;
   switch (item.kind) {
@@ -481,12 +557,13 @@ function renderTimeline(items: ChatItem[], forceScroll = false): void {
     cancelAnimationFrame(frameHandle);
     frameHandle = 0;
   }
-  if (items.length === 0) {
+  const visible = items.filter((item) => !isHiddenItem(item));
+  if (visible.length === 0) {
     host.appendChild(emptyHint());
     return;
   }
   const frag = document.createDocumentFragment();
-  for (const item of items) {
+  for (const item of visible) {
     const node = renderItem(item);
     itemEls.set(item.id, node);
     frag.appendChild(node);
@@ -496,6 +573,7 @@ function renderTimeline(items: ChatItem[], forceScroll = false): void {
 }
 
 function upsertItem(item: ChatItem, forceScroll = false): void {
+  if (isHiddenItem(item)) return;
   const host = timelineEl();
   if (itemEls.size === 0 && host.querySelector('.empty-hint')) host.innerHTML = '';
   const old = itemEls.get(item.id);
@@ -531,6 +609,13 @@ function applyPatch(id: string, patch: Partial<ChatItem>): void {
   if (!item) return;
   Object.assign(item, patch);
   const old = itemEls.get(id);
+  if (isHiddenItem(item)) {
+    if (old) {
+      old.remove();
+      itemEls.delete(id);
+    }
+    return;
+  }
   // 流式追加：只就地更新文本节点，不重建整段 DOM
   if (old && patch.streaming !== false && updateStreamingNode(old, item)) return;
   streamRenderers.delete(item.id);
@@ -602,10 +687,80 @@ function applyStatus(): void {
   usageEl.textContent = '入 ' + inTok + cacheSuffix + ' · 出 ' + outTok + ' tokens' + costSuffix;
   usageEl.title = '输入合计 ' + inTok + ' = 缓存命中 ' + fmtNum(hitTok) + ' + 未命中 ' + fmtNum(missTok) +
     '；输出 ' + outTok + ' tokens';
+  // 输入框下方只留「入 · 出 · 金额」，命中/未命中明细放进悬浮提示（顶部 #usage 仍保留明细）
   const meter = document.getElementById('tokenMeter');
-  if (meter) meter.textContent = '入 ' + inTok + cacheSuffix + ' · 出 ' + outTok + costSuffix;
-  ($('startBtn') as HTMLButtonElement).disabled = state.status.running;
+  if (meter) {
+    meter.textContent = '入 ' + inTok + ' · 出 ' + outTok + costSuffix;
+    meter.title = usageEl.title;
+  }
+  // 价格左侧：当前工具场景档位（含注入开关状态），随状态刷新同步
+  renderSceneMode();
+  // 运行中不再禁用发送：改为「插入消息」，点了就把当前输入插进正在跑的任务（下一轮请求生效）
+  const startBtn = $('startBtn') as HTMLButtonElement;
+  const running = !!state.status.running;
+  startBtn.disabled = false;
+  const label = running ? '插入消息' : '开始任务';
+  if (startBtn.textContent !== label) startBtn.textContent = label;
+  startBtn.title = running
+    ? '当前任务正在运行：发送的内容会插入本任务，并在下一轮请求生效（不会打断本轮）'
+    : '开始一个新任务';
   ($('stopBtn') as HTMLButtonElement).disabled = !state.status.running;
+}
+
+/**
+ * 当前会话的工具场景。场景是**每个对话单独**的：会话有覆盖记录就用它；
+ * 没有记录时回落到全局设置（新会话默认值），此时 inherited=true。
+ */
+function currentScene(): SessionSceneState {
+  if (state && state.scene) return state.scene;
+  const s = state ? state.settings : null;
+  return {
+    toolScene: s ? s.toolScene : 'general',
+    sceneGuideEnabled: s ? s.sceneGuideEnabled : true,
+    inherited: true,
+  };
+}
+
+/** 保存会话级场景：只写当前会话的元数据，绝不改全局设置，因此不影响其它对话 */
+async function saveScene(patch: { toolScene?: string; sceneGuideEnabled?: boolean }): Promise<void> {
+  const sid = state ? state.session.id : '';
+  if (!sid) return;
+  try {
+    const res = await api<{ scene: SessionSceneState }>(
+      '/api/sessions/' + encodeURIComponent(sid) + '/scene', 'POST', patch);
+    if (state && res && res.scene) state.scene = res.scene;
+    renderSceneMode();
+    if (!($('settingsOverlay').classList.contains('hidden')) && activeSection === 'scene') buildSettings();
+    toast('已更新本会话的工具场景（只影响当前对话）');
+  } catch (err) {
+    let msg = err instanceof Error ? err.message : String(err);
+    // 改了代码但服务端没重启时该路由还不存在：直接说清原因，别让用户看到裸的 HTTP 404
+    if (/^\s*HTTP 404\s*$|not found/i.test(msg)) msg = '服务端尚未重启，会话级场景接口暂不可用（重启后生效）';
+    toast('更新场景失败：' + msg, true);
+  }
+}
+
+/** 输入框下方价格左侧的场景标记：显示**当前会话**的工具场景档位，点击打开设置「工具场景」分区 */
+function renderSceneMode(): void {
+  const host = document.getElementById('sceneMode');
+  if (!host || !state) return;
+  const cur = currentScene();
+  const scene = getScene(cur.toolScene);
+  const general = cur.toolScene === 'general';
+  const guided = !general && !!cur.sceneGuideEnabled;
+  host.textContent = general
+    ? '场景 通用'
+    : '场景 ' + scene.label + (cur.sceneGuideEnabled ? '' : '（未注入）');
+  host.classList.toggle('on', guided);
+  host.classList.toggle('off', !guided);
+  const scope = cur.inherited
+    ? '；本会话尚未单独设置，沿用全局默认值（改动只影响本会话）'
+    : '；本会话单独设置，其它对话不受影响';
+  host.title = general
+    ? '当前工具场景：通用（不注入场景工具指引，工具描述也不做场景增强；点击打开设置）' + scope
+    : (cur.sceneGuideEnabled
+      ? '当前工具场景：' + scene.label + '（' + scene.tagline + '）；每轮请求会注入该场景的工具用法指引' + scope
+      : '当前工具场景：' + scene.label + '，但注入开关已关闭，只保留工具描述增强' + scope);
 }
 
 function renderGrants(): void {
@@ -613,34 +768,103 @@ function renderGrants(): void {
   if (!chip || !state) return;
   const list = state.grants || [];
   const readable = state.readGrants || [];
-  if (list.length === 0 && readable.length === 0) {
+  const count = document.getElementById('grantsCount');
+  const pop = document.getElementById('grantsPop');
+  const total = list.length + readable.length;
+  if (total === 0) {
     chip.classList.add('hidden');
-    chip.textContent = '';
+    if (count) count.textContent = '0';
+    if (pop) pop.innerHTML = '';
     chip.title = '';
     return;
   }
   chip.classList.remove('hidden');
-  chip.textContent = '\u{1F513} ' + (list.length + readable.length);
-  chip.title = [
-    list.length > 0 ? '本会话已授权可写：\n' + list.join('\n') : '',
-    readable.length > 0 ? '本会话已授权可读：\n' + readable.join('\n') : '',
-  ].filter(Boolean).join('\n');
+  if (count) count.textContent = String(total);
+  if (!pop) return;
+  const host = pop;
+  host.innerHTML = '';
+  host.appendChild(el('div', 'grants-pop-head', '本会话已授权 ' + total + ' 个目录'));
+  const addGroup = (title: string, items: string[], cls: string): void => {
+    const box = el('div', 'grants-group ' + cls);
+    box.appendChild(el('div', 'grants-group-title', title + ' · ' + items.length));
+    for (const p of items) box.appendChild(el('div', 'grants-path', p));
+    host.appendChild(box);
+  };
+  if (list.length > 0) addGroup('可写目录', list, 'write');
+  if (readable.length > 0) addGroup('只读目录', readable, 'read');
+  host.appendChild(el('div', 'grants-pop-foot', '仅本会话内有效；删除会话后失效'));
 }
 
 let docTab: 'record' | 'notes' = 'record';
+
+/** 统计「## 任务计划」小节内的清单完成度；没有该小节时统计全文。 */
+function countPlanTasks(md: string): { done: number; total: number } {
+  const lines = md.split(/\r?\n/);
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^##\s/.test(lines[i])) continue;
+    if (start < 0) {
+      if (/^##\s*任务计划/.test(lines[i])) start = i + 1;
+      continue;
+    }
+    end = i;
+    break;
+  }
+  const scope = start >= 0 ? lines.slice(start, end) : lines;
+  let done = 0;
+  let total = 0;
+  for (const line of scope) {
+    const m = /^\s*[-*+]\s*\[([ xX])\]/.exec(line);
+    if (!m) continue;
+    total += 1;
+    if (m[1] !== ' ') done += 1;
+  }
+  return { done, total };
+}
+
+/** 字符数胶囊文案：1234 → 1.2k。 */
+function fmtChars(n: number): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return (k < 10 ? k.toFixed(1) : String(Math.round(k))) + 'k';
+}
 
 function renderDoc(): void {
   if (!state) return;
   const md = docTab === 'record' ? state.record : state.notes;
   const meta = $('docMeta');
   meta.innerHTML = '';
+  let ratio = 0;
   if (docTab === 'record') {
-    meta.appendChild(el('span', '', 'sessions/' + state.session.id + '/ · 阶段性整份覆盖'));
-    meta.appendChild(el('span', '', state.record.length + ' 字符'));
+    const pathEl = el('span', 'doc-meta-path', 'sessions/' + state.session.id + '/');
+    pathEl.title = 'sessions/' + state.session.id + '/ · 阶段性整份覆盖';
+    meta.appendChild(pathEl);
+    const tasks = countPlanTasks(state.record);
+    if (tasks.total > 0) {
+      const allDone = tasks.done >= tasks.total;
+      meta.appendChild(
+        el('span', 'doc-meta-pill' + (allDone ? ' ok' : ''), '清单 ' + tasks.done + '/' + tasks.total),
+      );
+      ratio = tasks.done / tasks.total;
+    }
+    meta.appendChild(el('span', 'doc-meta-pill', fmtChars(state.record.length) + ' 字'));
   } else {
-    meta.appendChild(el('span', '', '长期工作笔记 · 上限 ' + state.notesMax));
-    meta.appendChild(el('span', '', state.notesLength + ' / ' + state.notesMax));
+    const label = el('span', 'doc-meta-path', '长期工作笔记');
+    label.title = '长期工作笔记 · 上限 ' + state.notesMax + ' 字符';
+    meta.appendChild(label);
+    ratio = state.notesMax > 0 ? Math.min(1, state.notesLength / state.notesMax) : 0;
+    const cls = ratio >= 0.9 ? ' warn' : ratio >= 0.7 ? ' ok' : '';
+    meta.appendChild(
+      el('span', 'doc-meta-pill' + cls, fmtChars(state.notesLength) + ' / ' + fmtChars(state.notesMax)),
+    );
   }
+  // 底部 2px 进度线：工作记录=清单完成度，工作笔记=容量占用
+  const bar = el('div', 'doc-progress');
+  const fill = el('i', '');
+  fill.style.width = Math.round(ratio * 100) + '%';
+  bar.appendChild(fill);
+  meta.appendChild(bar);
   $('docView').innerHTML = renderMarkdown(md || '（空）');
 }
 
@@ -771,6 +995,12 @@ function handleEvent(event: ServerEvent): void {
       state.target = event.target;
       applyTarget();
       break;
+    case 'scene':
+      // 会话级场景被改（本窗口或模型调用 set_scene）：同步标记与设置面板
+      state.scene = event.scene;
+      renderSceneMode();
+      if (activeSection === 'scene' && !$('settingsOverlay').classList.contains('hidden')) buildSettings();
+      break;
     default:
       break;
   }
@@ -806,28 +1036,38 @@ interface FieldDef {
   secret?: 'apiKey' | 'cloudTtsApiKey';
 }
 
+/** 价格统计的口径说明（原「价格统计」分区的说明文字，并入多模型后仍完整保留） */
+const PRICING_NOTE = '价格统计：单价按「每百万 tokens」填写（与主流厂商报价口径一致），金额 = tokens / 1000000 × 单价。输入 token 拆成两段分别计价：命中的部分按「缓存命中单价」、未命中的部分按「缓存未命中单价」，输出单独计价；三项都填 0 表示不计费，界面上不显示金额。缓存命中数优先采用服务商上报值（OpenAI 的 prompt_tokens_details.cached_tokens、DeepSeek 的 prompt_cache_hit_tokens）；接口未上报时按「上一条请求的输入前缀被复用」估算，属于预估值（界面显示为 ≈）。';
+
 const SECTIONS: Array<{ id: string; title: string; note?: string; fields: FieldDef[] }> = [
   {
-    id: 'api',
-    title: '接口与模型',
-    note: 'OpenAI 兼容的 /chat/completions 接口。密钥只保存在服务端，不会回传到浏览器。',
+    id: 'appearance',
+    title: '外观',
+    note: '切换界面主题。选择后立即预览，点下面的保存按钮才会持久化到服务端设置。',
     fields: [
-      { key: 'apiBaseUrl', label: 'API 地址', type: 'text', hint: '例如 https://api.openai.com/v1 或 https://api.deepseek.com/v1' },
-      { key: 'apiKey', label: 'API Key', type: 'password', secret: 'apiKey', hint: '留空表示保持当前密钥不变' },
-      { key: 'model', label: '模型名称', type: 'text' },
       {
-        key: 'reasoningEffort', label: '思考强度', type: 'select',
+        key: 'theme', label: '主题', type: 'select',
         options: [
-          { value: 'auto', label: 'auto（不发送 reasoning_effort）' },
-          { value: 'minimal', label: 'minimal' },
-          { value: 'low', label: 'low' },
-          { value: 'medium', label: 'medium' },
-          { value: 'high', label: 'high' },
+          { value: 'dark', label: '深色（默认）' },
+          { value: 'light', label: '白天' },
         ],
+        hint: '白天主题适合强光环境；深色主题适合长时间阅读',
       },
-      { key: 'temperature', label: 'Temperature', type: 'number', min: 0, max: 2, step: 0.1 },
-      { key: 'maxOutputTokens', label: '最大输出 tokens', type: 'number', min: 256, max: 384000, step: 256 },
     ],
+  },
+  {
+    id: 'scene',
+    title: '工具场景',
+    // 场景是会话级设置（每个对话各存一份），因此这里没有全局字段：控件由 buildSettings 单独渲染，
+    // 改动立即写入当前会话，不经过「保存设置」按钮，也不会覆盖其它对话。
+    note: '场景是每个对话单独的设置：在这里改动只影响当前会话，多会话并行时各对话按各自的场景注入指引，互不干扰。不同任务类型适用不同的工具组合与操作套路；选定场景后，该会话每轮请求的提示词会注入对应指引（推荐工具链 / 操作要点 / 常见失效），并据此增强相关工具描述。选「通用」不注入指引。',
+    fields: [],
+  },
+  {
+    id: 'models',
+    title: '多模型',
+    note: '模型都在下面这张清单里配置：每套模型自带 API 地址、模型名、密钥、思考强度、Temperature、最大输出 tokens、是否关闭思考与单价，保存后即可在聊天输入框旁的下拉里切换。密钥只保存在服务端，不会回传到浏览器。',
+    fields: [],
   },
   {
     id: 'backup',
@@ -842,23 +1082,6 @@ const SECTIONS: Array<{ id: string; title: string; note?: string; fields: FieldD
         key: 'changedBackupMaxFiles', label: '最多保留份数', type: 'number',
         min: 1, max: 5000, step: 1, hint: '超出后按时间从旧到新删除'
       },
-    ],
-  },
-  {
-    id: 'pricing',
-    title: '价格统计',
-    note: '单价按「每百万 tokens」填写（与主流厂商报价口径一致），金额 = tokens / 1000000 × 单价。输入 token 拆成两段分别计价：命中的部分按「缓存命中单价」、未命中的部分按「缓存未命中单价」，输出单独计价；三项都填 0 表示不计费，界面上不显示金额。缓存命中数优先采用服务商上报值（OpenAI 的 prompt_tokens_details.cached_tokens、DeepSeek 的 prompt_cache_hit_tokens）；接口未上报时按「上一条请求的输入前缀被复用」估算，属于预估值（界面显示为 ≈）。',
-    fields: [
-      {
-        key: 'priceCacheHit', label: '缓存命中输入单价（每百万 tokens）', type: 'number',
-        min: 0, max: 10000, step: 0.01, hint: '命中缓存的那部分输入按此价，通常远低于未命中单价',
-      },
-      {
-        key: 'priceInput', label: '缓存未命中输入单价（每百万 tokens）', type: 'number',
-        min: 0, max: 10000, step: 0.01, hint: '未命中缓存的输入（输入总量 - 命中）按此价',
-      },
-      { key: 'priceOutput', label: '输出单价（每百万 tokens）', type: 'number', min: 0, max: 10000, step: 0.01 },
-      { key: 'priceCurrency', label: '货币符号', type: 'text', hint: '默认 ¥；用美元可填 $' },
     ],
   },
   {
@@ -976,7 +1199,7 @@ const SECTIONS: Array<{ id: string; title: string; note?: string; fields: FieldD
   },
 ];
 
-let activeSection = 'api';
+let activeSection = 'models';
 
 interface TipEntryView {
   id: string;
@@ -1028,6 +1251,306 @@ async function loadTipsList(host: HTMLElement): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- 多模型（设置面板）
+/**
+ * 模型行草稿。每一行就是这套模型的完整配置（界面上不再有独立的全局输入项）。
+ * 空串 = 该行不覆盖、用默认值（服务端保留的默认配置）。
+ */
+interface ModelDraft {
+  id: string;
+  name: string;
+  apiBaseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+  // ---- 逐项覆盖（空串 = 用默认值）----
+  reasoningEffort: string;
+  temperature: string;
+  maxOutputTokens: string;
+  /** '' 用默认值 / 'on' 关闭思考 / 'off' 保留思考 */
+  disableThinking: string;
+  priceCacheHit: string;
+  priceInput: string;
+  priceOutput: string;
+  priceCurrency: string;
+}
+
+/** 数字型覆盖的草稿文本：undefined（没覆盖）显示为空，让用户一眼看出「用默认值」 */
+function overrideNumText(v: number | undefined): string {
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : '';
+}
+
+/** 设置面板里的多模型草稿：打开面板时从 state 同步，保存时整体回传 */
+let modelDrafts: ModelDraft[] = [];
+/** 草稿里当前选中的模型 id（空字符串 = 用默认配置） */
+let modelActiveId = '';
+/** 是否真的编辑过多模型（没打开过该分区就不提交，避免误清空已有配置） */
+let modelDirty = false;
+/** 多模型分区是否渲染过（决定保存时是否收集 DOM 里的编辑） */
+let modelSectionRendered = false;
+
+function syncModelDrafts(): void {
+  const list = state?.settings.modelProfiles || [];
+  modelDrafts = list.map((m) => ({
+    id: m.id, name: m.name, apiBaseUrl: m.apiBaseUrl, model: m.model, hasApiKey: m.hasApiKey,
+    reasoningEffort: m.reasoningEffort || '',
+    temperature: overrideNumText(m.temperature),
+    maxOutputTokens: overrideNumText(m.maxOutputTokens),
+    disableThinking: m.disableThinking === undefined ? '' : (m.disableThinking ? 'on' : 'off'),
+    priceCacheHit: overrideNumText(m.priceCacheHit),
+    priceInput: overrideNumText(m.priceInput),
+    priceOutput: overrideNumText(m.priceOutput),
+    priceCurrency: m.priceCurrency || '',
+  }));
+  modelActiveId = state?.settings.activeModelId || '';
+  modelDirty = false;
+}
+
+function nextModelId(): string {
+  let n = 1;
+  while (modelDrafts.some((d) => d.id === 'm' + n)) n += 1;
+  return 'm' + n;
+}
+
+/** 把界面上的编辑读回草稿（切换分区、增删条目之前调用，避免丢编辑） */
+function readModelRows(): void {
+  const rows = document.querySelectorAll<HTMLElement>('.model-row');
+  if (rows.length === 0) return;
+  const byId = new Map<string, ModelDraft>();
+  rows.forEach((row) => {
+    const id = row.dataset.id || '';
+    if (!id) return;
+    const get = (sel: string) => ((row.querySelector(sel) as HTMLInputElement | null)?.value ?? '');
+    byId.set(id, {
+      id,
+      name: get('.model-name').trim(),
+      apiBaseUrl: get('.model-base').trim(),
+      model: get('.model-id').trim(),
+      hasApiKey: modelDrafts.find((d) => d.id === id)?.hasApiKey ?? false,
+      reasoningEffort: get('.model-effort'),
+      temperature: get('.model-temp').trim(),
+      maxOutputTokens: get('.model-out').trim(),
+      disableThinking: get('.model-nothink'),
+      priceCacheHit: get('.model-price-hit').trim(),
+      priceInput: get('.model-price-input').trim(),
+      priceOutput: get('.model-price-output').trim(),
+      priceCurrency: get('.model-currency').trim(),
+    });
+  });
+  modelDrafts = modelDrafts.map((d) => byId.get(d.id) || d);
+}
+
+function modelField(label: string, cls: string, value: string, placeholder: string, type = 'text', hint = ''): HTMLElement {
+  const wrap = el('div', 'field');
+  wrap.appendChild(el('label', '', label));
+  const input = el('input') as HTMLInputElement;
+  input.type = type;
+  input.className = cls;
+  input.value = value;
+  if (placeholder) input.placeholder = placeholder;
+  input.addEventListener('input', () => {
+    modelDirty = true;
+  });
+  wrap.appendChild(input);
+  if (hint) wrap.appendChild(el('div', 'hint', hint));
+  return wrap;
+}
+
+/** 下拉型覆盖项：value 为空串 = 用默认值（与文本框留空同义） */
+function modelSelect(label: string, cls: string, value: string, options: Array<[string, string]>, hint = ''): HTMLElement {
+  const wrap = el('div', 'field');
+  wrap.appendChild(el('label', '', label));
+  const sel = el('select') as HTMLSelectElement;
+  sel.className = cls;
+  for (const [v, text] of options) {
+    const opt = el('option', '', text) as HTMLOptionElement;
+    opt.value = v;
+    sel.appendChild(opt);
+  }
+  sel.value = value;
+  sel.addEventListener('change', () => {
+    modelDirty = true;
+  });
+  wrap.appendChild(sel);
+  if (hint) wrap.appendChild(el('div', 'hint', hint));
+  return wrap;
+}
+
+function renderModelSection(body: HTMLElement): void {
+  modelSectionRendered = true;
+  body.appendChild(el('p', 'section-note',
+    '保存后，聊天输入框旁会出现「模型」下拉，可随时切换，切换后下一轮请求即用新模型。' +
+    '每套模型的密钥只保存在服务端；留空的项（思考强度、Temperature、最大输出 tokens、' +
+    '是否关闭思考、三项单价与货币符号）用输入框占位文案里显示的默认值。'));
+  const host = el('div', 'model-list');
+  host.id = 'modelList';
+  body.appendChild(host);
+  renderModelList(host);
+}
+
+interface ConnectionTestResult {
+  id: string;
+  name: string;
+  model: string;
+  apiBaseUrl: string;
+  keyTail: string;
+  ok: boolean;
+  message: string;
+  ms: number;
+}
+
+/** 清掉上一次「多 API 测试」留在模型行头的标记。 */
+function clearTestMarks(): void {
+  for (const old of Array.from(document.querySelectorAll('.model-row-test'))) old.remove();
+}
+
+/** 把每条测试结果标到对应的模型行头；清单外的目标（全局配置）只体现在面板底部汇总里。 */
+function paintTestResults(results: ConnectionTestResult[]): void {
+  clearTestMarks();
+  for (const r of results) {
+    if (!r.id) continue;
+    const row = document.querySelector('.model-row[data-id="' + r.id + '"]');
+    const head = row ? row.querySelector('.model-row-head') : null;
+    if (!head) continue;
+    const tag = el('span', 'model-row-test ' + (r.ok ? 'ok' : 'bad'),
+      (r.ok ? '可用 ' : '失败 ') + r.keyTail + ' · ' + r.ms + 'ms');
+    tag.title = r.message;
+    head.appendChild(tag);
+  }
+}
+
+/** 只重画模型清单：增删、切换当前都不重画整个分区，避免丢掉上面字段里未保存的编辑 */
+function renderModelList(host: HTMLElement): void {
+  host.innerHTML = '';
+  if (modelDrafts.length === 0) {
+    const empty = el('div', 'model-empty');
+    empty.appendChild(el('div', 'model-empty-title', '还没有添加模型'));
+    empty.appendChild(el('div', 'model-empty-text',
+      '点下面「+ 添加模型」新增一套：填模型名、API 地址和密钥即可开始使用；名称、参数与单价可按需填写。'));
+    host.appendChild(empty);
+  }
+  for (const d of modelDrafts) {
+    const row = el('div', 'model-row' + (d.id === modelActiveId ? ' current' : ''));
+    row.dataset.id = d.id;
+
+    const head = el('div', 'model-row-head');
+    head.appendChild(el('span', 'model-row-id', d.id));
+    if (d.id === modelActiveId) head.appendChild(el('span', 'model-row-badge', '当前使用'));
+    // 行头的密钥来源提示已按要求隐藏；同样的信息由下方密钥输入框的 placeholder 承担
+
+    const actions = el('div', 'model-row-actions');
+    const useBtn = el('button', 'model-row-btn', d.id === modelActiveId ? '已在使用' : '设为当前') as HTMLButtonElement;
+    useBtn.type = 'button';
+    useBtn.disabled = d.id === modelActiveId;
+    useBtn.addEventListener('click', () => {
+      readModelRows();
+      modelActiveId = d.id;
+      modelDirty = true;
+      renderModelList(host);
+    });
+    const delBtn = el('button', 'model-row-btn danger', '删除') as HTMLButtonElement;
+    delBtn.type = 'button';
+    delBtn.addEventListener('click', () => {
+      readModelRows();
+      modelDrafts = modelDrafts.filter((x) => x.id !== d.id);
+      if (modelActiveId === d.id) modelActiveId = '';
+      modelDirty = true;
+      renderModelList(host);
+    });
+    actions.appendChild(useBtn);
+    actions.appendChild(delBtn);
+    head.appendChild(actions);
+    row.appendChild(head);
+
+    const fields = el('div', 'model-row-fields');
+    const g = state?.settings;
+    // 占位文案统一写成「默认（当前值）」：留空即用该默认值（界面上不再有独立的全局输入项）
+    const defNum = (v: number | undefined) => '默认（' + String(v ?? 0) + '）';
+    fields.appendChild(modelField('名称', 'model-name', d.name, '例如 快速 / 深思'));
+    fields.appendChild(modelField('模型名', 'model-id', d.model, '必填，例如 gpt-4o-mini'));
+    fields.appendChild(modelField('API 地址', 'model-base', d.apiBaseUrl, '必填，例如 https://api.deepseek.com/v1'));
+    fields.appendChild(modelField('密钥', 'model-key', '',
+      d.hasApiKey ? '已保存（留空不修改）' : '必填，例如 sk-…', 'password'));
+    // ---- 可选项：留空 / 选「默认」即用括号里显示的默认值 ----
+    fields.appendChild(modelSelect('思考强度', 'model-effort', d.reasoningEffort, [
+      ['', '默认（' + String(g?.reasoningEffort || 'auto') + '）'],
+      ['auto', 'auto（不附带 reasoning_effort）'],
+      ['minimal', 'minimal'],
+      ['low', 'low'],
+      ['medium', 'medium'],
+      ['high', 'high'],
+    ]));
+    fields.appendChild(modelField('Temperature', 'model-temp', d.temperature,
+      '默认（' + String(g?.temperature ?? 1) + '）', 'number', '留空 = 用默认值'));
+    fields.appendChild(modelField('最大输出 tokens', 'model-out', d.maxOutputTokens,
+      '默认（' + String(g?.maxOutputTokens ?? 8192) + '）', 'number', '留空 = 用默认值'));
+    fields.appendChild(modelSelect('关闭模型思考', 'model-nothink', d.disableThinking, [
+      ['', '默认（' + (g?.disableThinking ? '关闭' : '保留') + '）'],
+      ['on', '关闭思考'],
+      ['off', '保留思考'],
+    ]));
+    fields.appendChild(modelField('缓存命中输入单价', 'model-price-hit', d.priceCacheHit,
+      defNum(g?.priceCacheHit), 'number', '每百万 tokens；留空 = 用默认值'));
+    fields.appendChild(modelField('缓存未命中输入单价', 'model-price-input', d.priceInput,
+      defNum(g?.priceInput), 'number', '每百万 tokens；留空 = 用默认值'));
+    fields.appendChild(modelField('输出单价', 'model-price-output', d.priceOutput,
+      defNum(g?.priceOutput), 'number', '每百万 tokens；留空 = 用默认值'));
+    fields.appendChild(modelField('货币符号', 'model-currency', d.priceCurrency,
+      '默认（' + String(g?.priceCurrency || '¥') + '）', 'text', '留空 = 用默认值'));
+    row.appendChild(fields);
+    host.appendChild(row);
+  }
+
+  const addBtn = el('button', 'model-add', '+ 添加模型') as HTMLButtonElement;
+  addBtn.type = 'button';
+  addBtn.disabled = modelDrafts.length >= 12;
+  addBtn.title = modelDrafts.length >= 12 ? '最多 12 套配置' : '新增一套模型配置';
+  addBtn.addEventListener('click', () => {
+    readModelRows();
+    modelDrafts = modelDrafts.concat({
+      id: nextModelId(), name: '', apiBaseUrl: '', model: '', hasApiKey: false,
+      // 新行与第一行字段完全一致，初始全部留空 = 用默认值
+      reasoningEffort: '', temperature: '', maxOutputTokens: '', disableThinking: '',
+      priceCacheHit: '', priceInput: '', priceOutput: '', priceCurrency: '',
+    });
+    modelDirty = true;
+    renderModelList(host);
+  });
+  host.appendChild(addBtn);
+}
+
+/** 收集多模型编辑结果；没碰过这个分区就返回 null（不提交，保持服务端原值） */
+function collectModelProfiles(): Record<string, unknown> | null {
+  if (!modelDirty && !modelSectionRendered) return null;
+  readModelRows();
+  const keyById = new Map<string, string>();
+  document.querySelectorAll<HTMLElement>('.model-row').forEach((row) => {
+    const id = row.dataset.id || '';
+    const key = ((row.querySelector('.model-key') as HTMLInputElement | null)?.value ?? '').trim();
+    if (id && key) keyById.set(id, key);
+  });
+  const profiles: Array<Record<string, unknown>> = [];
+  for (const d of modelDrafts) {
+    if (!d.model.trim()) continue;
+    const item: Record<string, unknown> = {
+      id: d.id, name: d.name, apiBaseUrl: d.apiBaseUrl, model: d.model,
+      // 覆盖项原样回传：空串由服务端 sanitize 解析成「不覆盖（用默认值）」
+      reasoningEffort: d.reasoningEffort,
+      temperature: d.temperature,
+      maxOutputTokens: d.maxOutputTokens,
+      priceCacheHit: d.priceCacheHit,
+      priceInput: d.priceInput,
+      priceOutput: d.priceOutput,
+      priceCurrency: d.priceCurrency,
+    };
+    if (d.disableThinking === 'on') item.disableThinking = true;
+    if (d.disableThinking === 'off') item.disableThinking = false;
+    const key = keyById.get(d.id);
+    if (key) item.apiKey = key;
+    profiles.push(item);
+  }
+  return { modelProfiles: profiles, activeModelId: modelActiveId };
+}
+
 function buildSettings(): void {
   if (!state) return;
   const nav = $('settingsNav');
@@ -1039,6 +1562,7 @@ function buildSettings(): void {
     const btn = el('button', section.id === activeSection ? 'active' : '', section.title);
     btn.type = 'button';
     btn.addEventListener('click', () => {
+      if (modelSectionRendered) readModelRows();
       activeSection = section.id;
       buildSettings();
     });
@@ -1058,24 +1582,62 @@ function buildSettings(): void {
     body.appendChild(host);
     void loadTipsList(host);
   }
-  if (section.id === 'pricing') {
-    const prices = priceTable();
-    const st = state.status;
-    if (!hasPricing(prices)) {
-      body.appendChild(el('p', 'section-note', '尚未填写单价，界面不显示金额。'));
-    } else {
-      const c = computeCost({
-        promptTokens: st.promptTokens,
-        completionTokens: st.completionTokens,
-        cachedTokens: st.cachedTokens,
-      }, prices);
-      const cur = state.settings.priceCurrency || '¥';
-      body.appendChild(el('p', 'section-note',
-        '本次会话累计：缓存命中输入 ' + fmtNum(c.cacheHitTokens) + ' + 缓存未命中输入 ' + fmtNum(c.cacheMissTokens) +
-        ' + 输出 ' + fmtNum(c.outputTokens) + ' tokens → 合计 ' + formatMoney(c.total, cur) +
-        '（命中 ' + formatMoney(c.cacheCost, cur) + ' + 未命中 ' + formatMoney(c.inputCost, cur) +
-        ' + 输出 ' + formatMoney(c.outputCost, cur) + '）'));
+  if (section.id === 'scene') {
+    // 会话级场景：控件改动立即写当前会话（不走全局「保存设置」），避免多会话互相覆盖
+    const cur = currentScene();
+    const sc = getScene(cur.toolScene);
+    const sid = state.session ? state.session.id : '';
+    body.appendChild(el('p', 'section-note',
+      '作用范围：仅当前会话「' + (state.session ? (state.session.title || sid) : '未选择') + '」（' + sid + '）' +
+      (cur.inherited ? '；尚未单独设置，当前沿用全局默认值' : '；已单独设置，其它对话保持各自的场景')));
+
+    const grid = el('div', 'settings-grid');
+    const selWrap = el('div', 'field');
+    const selLabel = el('label', '', '本会话场景');
+    selLabel.htmlFor = 'f_scene_toolScene';
+    selWrap.appendChild(selLabel);
+    const sel = el('select') as HTMLSelectElement;
+    sel.id = 'f_scene_toolScene';
+    for (const o of sceneSelectOptions()) sel.appendChild(new Option(o.label, o.value));
+    sel.value = cur.toolScene;
+    sel.addEventListener('change', () => { void saveScene({ toolScene: sel.value }); });
+    selWrap.appendChild(sel);
+    selWrap.appendChild(el('div', 'hint', '改动立即写入本会话；模型也可用 set_scene 工具在本会话内运行时切换（例如从调研转到改代码）'));
+    grid.appendChild(selWrap);
+
+    const boxWrap = el('div', 'field check');
+    const box = el('input') as HTMLInputElement;
+    box.type = 'checkbox';
+    box.id = 'f_scene_guide';
+    box.checked = !!cur.sceneGuideEnabled;
+    box.addEventListener('change', () => { void saveScene({ sceneGuideEnabled: box.checked }); });
+    const boxText = el('div', 'check-text');
+    const boxLabel = el('label', '', '注入场景工具指引');
+    boxLabel.htmlFor = box.id;
+    boxText.appendChild(boxLabel);
+    boxText.appendChild(el('div', 'hint', '关闭后本会话只保留「按场景增强工具描述」，不再在提示词里注入场景指引段落'));
+    boxWrap.appendChild(box);
+    boxWrap.appendChild(boxText);
+    grid.appendChild(boxWrap);
+    body.appendChild(grid);
+
+    // 预览：本会话实际会注入的内容
+    body.appendChild(el('p', 'section-note',
+      cur.toolScene === 'general'
+        ? '当前场景：通用（不注入场景指引，工具描述也不做场景增强）'
+        : (cur.sceneGuideEnabled
+          ? '当前按「' + sc.label + '」注入：' + sc.tagline
+          : '当前档位「' + sc.label + '」，但注入开关已关闭（只保留工具描述增强）')));
+    if (sc.tools.length > 0) {
+      body.appendChild(el('p', 'section-note', '推荐工具链：' + sc.tools.join(' → ')));
     }
+    if (sc.rules.length > 0) {
+      body.appendChild(el('p', 'section-note', '操作要点：' + sc.rules.join('；')));
+    }
+    if (sc.pitfalls.length > 0) {
+      body.appendChild(el('p', 'section-note', '常见失效：' + sc.pitfalls.join('；')));
+    }
+    body.appendChild(el('p', 'section-note', '模型也可以在任务性质变化时用 set_scene 工具在本会话内自行切换，切换会立即落盘并广播到所有窗口。'));
   }
 
   if (section.id === 'backup' && state.backups) {
@@ -1088,8 +1650,11 @@ function buildSettings(): void {
     const p = state.plugins;
     body.appendChild(el('p', 'section-note',
       '目录：' + p.dir + '；插件 ' + p.items.length + ' 个，可用工具 ' +
-      p.items.reduce((n, it) => n + (it.error ? 0 : it.tools.length), 0) + ' 个；累计审计 ' + p.auditCount + ' 次' +
+      p.items.reduce((n, it) => n + (it.enabled ? it.tools.length : 0), 0) + ' 个；累计审计 ' + p.auditCount + ' 次' +
       (p.enabled ? '；已启用。' : '；已关闭，插件工具不会下发给模型。')));
+    body.appendChild(el('p', 'section-note',
+      '每个插件可以单独开启/关闭（立即生效；关闭后其工具从工具清单与提示词中撤下），也可以删除——目录会移入回收站 ' +
+      p.trashDir + '，需要时可手工拷回。'));
     const reloadBtn = el('button', 'tips-refresh', '重新扫描插件目录') as HTMLButtonElement;
     reloadBtn.type = 'button';
     reloadBtn.addEventListener('click', () => {
@@ -1117,15 +1682,63 @@ function buildSettings(): void {
       rowHead.appendChild(el('span', 'plugin-row-name', item.name + (item.version ? ' v' + item.version : '') + '（' + item.id + '）'));
       rowHead.appendChild(el('span', 'pill ' + (item.error ? 'err' : item.enabled ? 'ok' : ''),
         item.error ? '加载失败' : item.enabled ? '启用' : '已禁用'));
+      // 独立开关：加载失败的插件不允许开启；切换后服务端立即重建工具清单
+      const toggleBtn = el('button', 'plugin-row-btn', item.enabled ? '关闭' : '开启') as HTMLButtonElement;
+      toggleBtn.type = 'button';
+      toggleBtn.disabled = !!item.error;
+      toggleBtn.title = item.error
+        ? '该插件加载失败，无法开启'
+        : item.enabled ? '关闭该插件：立即把它的工具从清单里撤下' : '开启该插件：立即把它的工具加入清单';
+      toggleBtn.addEventListener('click', () => {
+        toggleBtn.disabled = true;
+        void (async () => {
+          try {
+            const data = await api<{ plugins: PluginState; availableToolCount: number }>(
+              '/api/plugins/toggle', 'POST', { id: item.id, enabled: !item.enabled });
+            if (state && data?.plugins) state.plugins = data.plugins;
+            buildSettings();
+            toast((item.enabled ? '已关闭插件：' : '已开启插件：') + item.id +
+              '（当前可用工具 ' + (data?.availableToolCount ?? 0) + ' 个）');
+          } catch (e) {
+            toast(e instanceof Error ? e.message : String(e), true);
+            toggleBtn.disabled = false;
+          }
+        })();
+      });
+      rowHead.appendChild(toggleBtn);
+      // 删除：移入回收站，必须二次确认
+      const delBtn = el('button', 'plugin-row-btn danger', '删除') as HTMLButtonElement;
+      delBtn.type = 'button';
+      delBtn.title = '删除该插件：目录移入回收站，可手工找回';
+      delBtn.addEventListener('click', () => {
+        if (!window.confirm('删除插件「' + item.name + '」（' + item.id + '）？\n插件目录会移入回收站：' + p.trashDir + '\n需要时可以手工拷回。')) return;
+        delBtn.disabled = true;
+        void (async () => {
+          try {
+            const data = await api<{ plugins: PluginState; movedTo: string }>('/api/plugins/remove', 'POST', { id: item.id });
+            if (state && data?.plugins) state.plugins = data.plugins;
+            buildSettings();
+            toast('已删除插件：' + item.id + '（已移入回收站，可手工找回）');
+          } catch (e) {
+            toast(e instanceof Error ? e.message : String(e), true);
+            delBtn.disabled = false;
+          }
+        })();
+      });
+      rowHead.appendChild(delBtn);
       row.appendChild(rowHead);
       row.appendChild(el('div', 'plugin-row-purpose', item.error ? '错误：' + item.error : '用途：' + item.purpose));
       row.appendChild(el('div', 'plugin-row-tools', '工具：' +
         (item.tools.length ? item.tools.map((t) => t.globalName).join('、') : '（无）')));
+      if (item.overridden && !item.error) {
+        row.appendChild(el('div', 'plugin-row-tools',
+          '开关来源：手动设置（清单声明为' + (item.manifestEnabled ? '启用' : '禁用') + '）'));
+      }
       host.appendChild(row);
     }
     body.appendChild(host);
   }
-  const grid = el('div', '');
+  const grid = el('div', 'settings-grid');
   let i = 0;
   for (const f of section.fields) {
     const value = f.secret ? '' : state.settings[f.key as keyof PublicSettings];
@@ -1137,8 +1750,12 @@ function buildSettings(): void {
       input.checked = !!value;
       const label = el('label', '', f.label);
       label.htmlFor = input.id;
+      // 勾选框靠左，标题与说明竖排在右：长 hint 不再被丢弃
+      const text = el('div', 'check-text');
+      text.appendChild(label);
+      if (f.hint) text.appendChild(el('div', 'hint', f.hint));
       wrap.appendChild(input);
-      wrap.appendChild(label);
+      wrap.appendChild(text);
       grid.appendChild(wrap);
       continue;
     }
@@ -1155,9 +1772,15 @@ function buildSettings(): void {
         input.appendChild(opt);
       }
       input.value = String(value ?? '');
+      if (f.key === 'theme') {
+        // 主题不需要等保存，选完立刻预览
+        input.addEventListener('change', () => applyTheme((input as HTMLSelectElement).value));
+      }
     } else if (f.type === 'textarea') {
       input = el('textarea') as HTMLTextAreaElement;
       input.value = String(value ?? '');
+      // 长文本跨满整行，避免被挤在半栏里
+      wrap.classList.add('wide');
     } else {
       input = el('input') as HTMLInputElement;
       input.type = f.type;
@@ -1181,7 +1804,38 @@ function buildSettings(): void {
     grid.appendChild(wrap);
     i++;
   }
-  body.appendChild(grid);
+  // 没有声明字段的分区（如「多模型」）不挂空容器，否则会渲染出一张空白边框卡片
+  if (section.fields.length > 0) body.appendChild(grid);
+
+  if (section.id === 'models') {
+    // 价格统计（原「价格统计」分区，已并入本分区）：先给口径说明，再给本次会话累计
+    body.appendChild(el('p', 'section-note', PRICING_NOTE));
+    const prices = priceTable();
+    const st = state.status;
+    if (!hasPricing(prices)) {
+      body.appendChild(el('p', 'section-note', '尚未填写单价，界面不显示金额。'));
+    } else {
+      const c = computeCost({
+        promptTokens: st.promptTokens,
+        completionTokens: st.completionTokens,
+        cachedTokens: st.cachedTokens,
+      }, prices);
+      const cur = state.settings.priceCurrency || '¥';
+      body.appendChild(el('p', 'section-note',
+        '本次会话累计：缓存命中输入 ' + fmtNum(c.cacheHitTokens) + ' + 缓存未命中输入 ' + fmtNum(c.cacheMissTokens) +
+        ' + 输出 ' + fmtNum(c.outputTokens) + ' tokens → 合计 ' + formatMoney(c.total, cur) +
+        '（命中 ' + formatMoney(c.cacheCost, cur) + ' + 未命中 ' + formatMoney(c.inputCost, cur) +
+        ' + 输出 ' + formatMoney(c.outputCost, cur) + '）'));
+    }
+    renderModelSection(body);
+  }
+}
+
+/** 打开设置面板（默认分区「多模型」）；空态按钮与顶栏按钮共用 */
+function openSettings(): void {
+  syncModelDrafts();
+  buildSettings();
+  $('settingsOverlay').classList.remove('hidden');
 }
 
 function collectSettings(): Record<string, unknown> {
@@ -1203,6 +1857,8 @@ function collectSettings(): Record<string, unknown> {
       }
     }
   }
+  const models = collectModelProfiles();
+  if (models) Object.assign(patch, models);
   return patch;
 }
 
@@ -1308,13 +1964,192 @@ async function deleteSession(id: string, title: string): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- 历史检索
+/** 搜索请求序号：只渲染最后一次请求的结果，避免慢响应覆盖新结果。 */
+let searchSeq = 0;
+let searchTimer: number | undefined;
+
+/** 把命中片段按关键词切成 <mark>（用文本节点拼接，不拼 HTML，天然免疫注入）。 */
+function highlightSnippet(snippet: string, terms: string[]): HTMLElement {
+  const box = el('span', 'search-snippet');
+  const lower = snippet.toLowerCase();
+  const ranges: Array<[number, number]> = [];
+  for (const t of terms) {
+    const term = t.toLowerCase();
+    if (!term) continue;
+    let from = 0;
+    while (from <= lower.length) {
+      const at = lower.indexOf(term, from);
+      if (at < 0) break;
+      ranges.push([at, at + term.length]);
+      from = at + Math.max(1, term.length);
+    }
+  }
+  if (ranges.length === 0) {
+    box.textContent = snippet;
+    return box;
+  }
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
+  }
+  let cursor = 0;
+  for (const [start, end] of merged) {
+    if (start > cursor) box.appendChild(document.createTextNode(snippet.slice(cursor, start)));
+    box.appendChild(el('mark', '', snippet.slice(start, end)));
+    cursor = end;
+  }
+  if (cursor < snippet.length) box.appendChild(document.createTextNode(snippet.slice(cursor)));
+  return box;
+}
+
+/** 命中来源的中文标签。 */
+function hitKindLabel(kind: string): string {
+  switch (kind) {
+    case 'session-title': return '标题';
+    case 'user': return '我';
+    case 'assistant': return '回复';
+    case 'system': return '系统';
+    case 'thinking': return '思考';
+    case 'tool': return '工具';
+    case 'record': return '记录';
+    case 'notes': return '笔记';
+    default: return kind;
+  }
+}
+
+/** 跳到命中所属会话，并把命中条目滚到中间闪一下（记录/笔记/标题命中只切会话）。 */
+async function jumpToHit(targetSession: string, itemId: string): Promise<void> {
+  try {
+    if (targetSession && targetSession !== sessionId) await switchSession(targetSession);
+  } catch (e) {
+    toast(e instanceof Error ? e.message : String(e), true);
+    return;
+  }
+  if (!itemId) return;
+  const node = itemEls.get(itemId);
+  if (!node) {
+    toast('该条消息已不在当前时间线（可能已被裁剪），已切换到会话', true);
+    return;
+  }
+  node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  node.classList.remove('hit-flash');
+  // 重排一次，让同一节点连续点击时动画能重新播放
+  void node.offsetWidth;
+  node.classList.add('hit-flash');
+  window.setTimeout(() => node.classList.remove('hit-flash'), 2400);
+}
+
+/** 渲染检索结果；搜索框清空时恢复会话列表（两个容器互斥显示）。 */
+function renderSearchResults(report: SessionSearchReport, query: string): void {
+  const host = $('searchResults');
+  const list = $('sessionList');
+  host.innerHTML = '';
+  host.classList.remove('hidden');
+  list.classList.add('hidden');
+
+  if (report.groups.length === 0) {
+    host.appendChild(el('div', 'search-head', '「' + query + '」没有命中'));
+    const hint = el('div', 'search-empty',
+      '已扫描 ' + report.scanned + ' 个会话。' +
+      (report.scope === 'chat' ? '把右上角范围切到「全部」可以连工具输出与工作记录/笔记一起搜。' : '换个关键词试试。'));
+    host.appendChild(hint);
+    return;
+  }
+
+  host.appendChild(el('div', 'search-head',
+    '命中 ' + report.groups.length + ' 个会话 · ' + report.totalHits + ' 条' +
+    (report.truncated ? '（已截断）' : '')));
+
+  for (const g of report.groups) {
+    const box = el('div', 'search-group' + (g.sessionId === sessionId ? ' active' : ''));
+    const head = el('div', 'search-group-head');
+    head.appendChild(el('span', 'search-group-title', g.title)).title = g.title;
+    head.appendChild(el('span', 'search-group-count', g.hitCount + ' 条'));
+    head.title = '切换到会话「' + g.title + '」';
+    head.addEventListener('click', () => void jumpToHit(g.sessionId, ''));
+    box.appendChild(head);
+
+    for (const hit of g.hits) {
+      const row = el('div', 'search-hit');
+      const kind = hitKindLabel(hit.kind);
+      row.appendChild(el('span', 'search-hit-kind', hit.time ? kind + ' ' + hit.time : kind));
+      row.appendChild(highlightSnippet(hit.snippet, report.terms));
+      row.title = hit.itemId ? '跳转并定位到这条消息' : '切换到该会话';
+      row.addEventListener('click', () => void jumpToHit(g.sessionId, hit.itemId));
+      box.appendChild(row);
+    }
+    if (g.hitCount > g.hits.length) {
+      box.appendChild(el('div', 'search-more', '另有 ' + (g.hitCount - g.hits.length) + ' 条命中未列出'));
+    }
+    host.appendChild(box);
+  }
+}
+
+/** 清空检索：恢复会话列表。 */
+function clearSearch(): void {
+  searchSeq++;
+  window.clearTimeout(searchTimer);
+  ($('sessionSearch') as HTMLInputElement).value = '';
+  const host = $('searchResults');
+  host.innerHTML = '';
+  host.classList.add('hidden');
+  $('sessionList').classList.remove('hidden');
+}
+
+async function runSearch(): Promise<void> {
+  const box = $('sessionSearch') as HTMLInputElement;
+  const query = box.value.trim();
+  if (!query) {
+    clearSearch();
+    return;
+  }
+  const scope = ($('searchScope') as HTMLSelectElement).value === 'all' ? 'all' : 'chat';
+  const seq = ++searchSeq;
+  try {
+    const report = await api<SessionSearchReport & { ok?: boolean }>(
+      '/api/sessions/search?q=' + encodeURIComponent(query) + '&scope=' + scope,
+    );
+    if (seq !== searchSeq) return; // 期间又输入了新内容，丢弃这次结果
+    renderSearchResults(report, query);
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    const msg = e instanceof Error ? e.message : String(e);
+    const host = $('searchResults');
+    host.innerHTML = '';
+    host.classList.remove('hidden');
+    $('sessionList').classList.add('hidden');
+    // 改了代码但服务端没重启时该路由还不存在：直接说清原因，别让用户看到裸的 HTTP 404
+    if (/^\s*HTTP 404\s*$|not found/i.test(msg)) {
+      host.appendChild(el('div', 'search-empty', '历史搜索要重启服务后才可用：当前服务进程还是旧版本，接口尚未注册；输入内容已保留。'));
+      return;
+    }
+    host.appendChild(el('div', 'search-empty', '搜索失败：' + msg));
+  }
+}
+
 // ---------------------------------------------------------------- 状态加载
+/** 应用界面主题：写到 <html data-theme>，并镜像到 localStorage（首屏内联脚本据此防闪）。 */
+function applyTheme(theme: string): void {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try {
+    localStorage.setItem('continuousagent.theme', next);
+  } catch {
+    /* 隐私模式下 localStorage 可能不可写，忽略即可 */
+  }
+}
+
 async function reloadState(id?: string): Promise<void> {
   const target = id || sessionId;
   const fresh = await api<AppState>('/api/state' + (target ? '?session=' + encodeURIComponent(target) : ''));
   const first = state === null;
   const switched = !!state && state.session.id !== fresh.session.id;
   state = fresh;
+  applyTheme(fresh.settings.theme);
   sessionId = fresh.session.id;
   localStorage.setItem('continuousagent.session', sessionId);
 
@@ -1325,6 +2160,7 @@ async function reloadState(id?: string): Promise<void> {
   if (switched || first) timelineEl().scrollTop = timelineEl().scrollHeight;
   const effort = document.getElementById('effortSelect') as HTMLSelectElement | null;
   if (effort) effort.value = fresh.settings.reasoningEffort || 'auto';
+  renderModelSelect();
   renderGrants();
   renderNativeBanner(fresh.nativeAvailable, fresh.nativeDetail);
   renderDoc();
@@ -1334,6 +2170,32 @@ async function reloadState(id?: string): Promise<void> {
 function bind(): void {
   ($('refreshWindows') as HTMLButtonElement).addEventListener('click', () => void refreshWindows());
   ($('newSession') as HTMLButtonElement).addEventListener('click', () => void newSession());
+
+  // ---- 历史检索 ----
+  const searchBox = $('sessionSearch') as HTMLInputElement;
+  searchBox.addEventListener('input', () => {
+    window.clearTimeout(searchTimer);
+    // 空输入立刻恢复列表；有内容则防抖 220ms 再发请求，避免逐字符打服务端
+    if (!searchBox.value.trim()) {
+      clearSearch();
+      return;
+    }
+    searchTimer = window.setTimeout(() => void runSearch(), 220);
+  });
+  searchBox.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      clearSearch();
+      searchBox.blur();
+    } else if (ev.key === 'Enter') {
+      ev.preventDefault();
+      window.clearTimeout(searchTimer);
+      void runSearch();
+    }
+  });
+  ($('searchScope') as HTMLSelectElement).addEventListener('change', () => {
+    if (searchBox.value.trim()) void runSearch();
+  });
 
   ($('clearWindow') as HTMLButtonElement).addEventListener('click', async () => {
     try {
@@ -1385,6 +2247,24 @@ function bind(): void {
     }
   });
 
+  const modelSelect = $('modelSelect') as HTMLSelectElement;
+  modelSelect.addEventListener('change', async () => {
+    const wanted = modelSelect.value;
+    modelSelect.disabled = true;
+    try {
+      const r = await api<{ activeModelId: string; model: string; state: AppState }>('/api/model/select', 'POST', { id: wanted });
+      state = r.state;
+      renderModelSelect();
+      toast(wanted ? '已切换模型：' + r.model + '（下一轮生效）' : '已回到默认模型：' + r.model);
+    } catch (err) {
+      // 失败时把下拉拨回服务端当前值，避免界面显示成功但实际没切换
+      renderModelSelect();
+      toast(err instanceof Error ? err.message : String(err), true);
+    } finally {
+      modelSelect.disabled = false;
+    }
+  });
+
   const fileInput = $('fileInput') as HTMLInputElement;
   ($('attachBtn') as HTMLButtonElement).addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', () => {
@@ -1421,9 +2301,10 @@ function bind(): void {
     });
   }
 
-  $('settingsBtn').addEventListener('click', () => {
-    buildSettings();
-    $('settingsOverlay').classList.remove('hidden');
+  $('settingsBtn').addEventListener('click', () => openSettings());
+  $('sceneMode').addEventListener('click', () => {
+    activeSection = 'scene';
+    openSettings();
   });
   $('closeSettings').addEventListener('click', () => $('settingsOverlay').classList.add('hidden'));
   $('settingsOverlay').addEventListener('click', (e) => {
@@ -1435,10 +2316,13 @@ function bind(): void {
       const patch = collectSettings();
       const data = await api<{ state: AppState }>('/api/settings', 'POST', patch);
       state = data.state;
+      syncModelDrafts();
+      applyTheme(data.state.settings.theme);
       applyStatus();
       applyTarget();
       const effort = document.getElementById('effortSelect') as HTMLSelectElement | null;
       if (effort) effort.value = state.settings.reasoningEffort || 'auto';
+      renderModelSelect();
       buildSettings();
       renderDoc();
       toast('设置已保存');
@@ -1453,9 +2337,16 @@ function bind(): void {
     try {
       // 先保存当前表单，测试才用得上新填入的 Key
       await api('/api/settings', 'POST', collectSettings());
-      const r = await api<{ ok: boolean; message: string }>('/api/test-connection', 'POST');
+      const r = await api<{ ok: boolean; message: string; results?: ConnectionTestResult[] }>('/api/test-connection', 'POST');
+      const results = r.results || [];
+      // 多 API 测试：汇总写底部提示，逐条结果标在对应模型行头
       hint.textContent = r.message;
-      toast(r.ok ? '连接成功' : '连接失败: ' + r.message, !r.ok);
+      paintTestResults(results);
+      const failed = results.filter((x) => !x.ok).length;
+      const title = r.ok
+        ? (results.length > 1 ? results.length + ' 个 API 全部连接成功' : '连接成功')
+        : (results.length > 1 ? failed + '/' + results.length + ' 个 API 测试失败' : '连接失败: ' + r.message);
+      toast(title, !r.ok);
     } catch (e) {
       hint.textContent = e instanceof Error ? e.message : String(e);
       toast('测试失败', true);
@@ -1569,13 +2460,35 @@ async function start(): Promise<void> {
     toast('请先描述要让 ContinuousAgent 做什么', true);
     return;
   }
+  // 正在跑：插入消息（不打断当前轮，下一轮请求带上）而不是开新任务
+  const inserting = !!state?.status.running;
   try {
-    await api('/api/agent/start', 'POST', { prompt, sessionId, attachments });
+    await api(inserting ? '/api/agent/message' : '/api/agent/start', 'POST', { prompt, sessionId, attachments });
     box.value = '';
     pendingAttachments = [];
     renderAttachments();
+    if (inserting) toast('已插入消息，将在下一轮请求生效');
   } catch (e) {
-    toast(e instanceof Error ? e.message : String(e), true);
+    const msg = e instanceof Error ? e.message : String(e);
+    // 服务端进程还是旧版本（改了代码但没重启）：该路由还不存在，直接说清原因，别让用户看到裸的 404
+    if (inserting && /^\s*HTTP 404\s*$|not found/i.test(msg)) {
+      toast('服务端尚未重启，「插入消息」要重启服务后才可用（输入内容已保留）', true);
+      return;
+    }
+    // 服务端说「没在运行」时（状态刚变更的竞态），退化成正常开始任务
+    if (inserting && /没有运行|无法插入/.test(msg)) {
+      try {
+        await api('/api/agent/start', 'POST', { prompt, sessionId, attachments });
+        box.value = '';
+        pendingAttachments = [];
+        renderAttachments();
+        return;
+      } catch (e2) {
+        toast(e2 instanceof Error ? e2.message : String(e2), true);
+        return;
+      }
+    }
+    toast(msg, true);
   }
 }
 
@@ -1601,8 +2514,180 @@ async function reset(): Promise<void> {
   }
 }
 
+/* ---------------------------------------------------------------- 三栏宽度拖拽（会话列表 / 对话 / 工作记录） */
+const LAYOUT_KEY = 'continuousagent.layout';
+const LAYOUT_SPLIT = 14;
+const LAYOUT_DEFAULTS: LayoutSize = { sessions: 216, side: 380 };
+const LAYOUT_MIN: LayoutSize = { sessions: 150, side: 280 };
+const LAYOUT_MAX: LayoutSize = { sessions: 520, side: 820 };
+const LAYOUT_CHAT_MIN = 360;
+
+interface LayoutSize { sessions: number; side: number; }
+type LayoutPane = 'sessions' | 'side';
+
+function numPx(raw: string, fallback: number): number {
+  const v = Number.parseFloat(raw);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+/** 读 localStorage 里保存的布局；坏数据/隐私模式一律回退默认值。 */
+function readLayoutSize(): LayoutSize {
+  const fallback: LayoutSize = { sessions: LAYOUT_DEFAULTS.sessions, side: LAYOUT_DEFAULTS.side };
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return fallback;
+    const p = JSON.parse(raw) as Partial<LayoutSize> | null;
+    const pick = (v: unknown, def: number, pane: LayoutPane): number => {
+      const n = typeof v === 'number' ? v : Number(v);
+      if (!Number.isFinite(n)) return def;
+      return Math.min(LAYOUT_MAX[pane], Math.max(LAYOUT_MIN[pane], Math.round(n)));
+    };
+    return { sessions: pick(p?.sessions, fallback.sessions, 'sessions'), side: pick(p?.side, fallback.side, 'side') };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveLayoutSize(size: LayoutSize): void {
+  try {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(size));
+  } catch {
+    /* 隐私模式下写不了就算了，不影响本次拖拽 */
+  }
+}
+
+/** main 的可用内容宽度（已去掉左右 padding）。 */
+function mainAvailWidth(): number {
+  const main = document.querySelector<HTMLElement>('main');
+  if (!main) return window.innerWidth;
+  const cs = window.getComputedStyle(main);
+  return Math.max(0, main.clientWidth - numPx(cs.paddingLeft, 0) - numPx(cs.paddingRight, 0));
+}
+
+/** 该栏在当前视口下是否真的可见（窄屏时 .side / .sessions 会被隐藏）。 */
+function paneVisible(selector: string): boolean {
+  const el = document.querySelector<HTMLElement>(selector);
+  return !!el && window.getComputedStyle(el).display !== 'none';
+}
+
+/** 夹取目标宽度：不小于本栏最小值，且给中间对话区留够 LAYOUT_CHAT_MIN。 */
+function clampPaneWidth(pane: LayoutPane, want: number, other: number): number {
+  const avail = mainAvailWidth();
+  const otherSelector = pane === 'sessions' ? 'main > .side' : 'main > .sessions';
+  const otherVisible = paneVisible(otherSelector);
+  const splitters = otherVisible ? LAYOUT_SPLIT * 2 : LAYOUT_SPLIT;
+  const room = avail - (otherVisible ? other : 0) - splitters - LAYOUT_CHAT_MIN;
+  const max = Math.max(LAYOUT_MIN[pane], Math.min(LAYOUT_MAX[pane], room));
+  return Math.round(Math.min(max, Math.max(LAYOUT_MIN[pane], want)));
+}
+
+function applyLayoutSize(size: LayoutSize): void {
+  const root = document.documentElement;
+  root.style.setProperty('--w-sessions', size.sessions + 'px');
+  root.style.setProperty('--w-side', size.side + 'px');
+}
+
+function currentLayoutSize(): LayoutSize {
+  const cs = window.getComputedStyle(document.documentElement);
+  return {
+    sessions: numPx(cs.getPropertyValue('--w-sessions'), LAYOUT_DEFAULTS.sessions),
+    side: numPx(cs.getPropertyValue('--w-side'), LAYOUT_DEFAULTS.side),
+  };
+}
+
+/** 两个宽度都按当前视口夹取一次（窗口缩小后不能把对话区挤成 0）。 */
+function fitLayoutSize(size: LayoutSize): LayoutSize {
+  const sessions = clampPaneWidth('sessions', size.sessions, size.side);
+  const side = clampPaneWidth('side', size.side, sessions);
+  return { sessions, side };
+}
+
+/** 绑定一条分隔条：拖拽改宽、双击复位、方向键微调。 */
+function bindSplitter(el: HTMLElement | null, pane: LayoutPane): void {
+  if (!el) return;
+  let drag: { startX: number; startW: number; other: number } | null = null;
+
+  const onMove = (ev: MouseEvent): void => {
+    if (!drag) return;
+    const delta = pane === 'sessions' ? ev.clientX - drag.startX : drag.startX - ev.clientX;
+    const width = clampPaneWidth(pane, drag.startW + delta, drag.other);
+    const size = currentLayoutSize();
+    if (pane === 'sessions') size.sessions = width;
+    else size.side = width;
+    applyLayoutSize(size);
+  };
+
+  const onUp = (): void => {
+    if (!drag) return;
+    drag = null;
+    el.classList.remove('dragging');
+    document.body.classList.remove('col-resizing');
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+    saveLayoutSize(currentLayoutSize());
+  };
+
+  el.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    const size = currentLayoutSize();
+    drag = {
+      startX: ev.clientX,
+      startW: pane === 'sessions' ? size.sessions : size.side,
+      other: pane === 'sessions' ? size.side : size.sessions,
+    };
+    el.classList.add('dragging');
+    document.body.classList.add('col-resizing');
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+
+  el.addEventListener('dblclick', () => {
+    const size = currentLayoutSize();
+    const width = clampPaneWidth(pane, LAYOUT_DEFAULTS[pane], pane === 'sessions' ? size.side : size.sessions);
+    if (pane === 'sessions') size.sessions = width;
+    else size.side = width;
+    applyLayoutSize(size);
+    saveLayoutSize(size);
+  });
+
+  el.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+    ev.preventDefault();
+    const step = (ev.shiftKey ? 48 : 16) * (ev.key === 'ArrowRight' ? 1 : -1);
+    const size = currentLayoutSize();
+    const width = clampPaneWidth(pane, (pane === 'sessions' ? size.sessions : size.side) + (pane === 'sessions' ? step : -step),
+      pane === 'sessions' ? size.side : size.sessions);
+    if (pane === 'sessions') size.sessions = width;
+    else size.side = width;
+    applyLayoutSize(size);
+    saveLayoutSize(size);
+  });
+}
+
+/** 初始化三栏可调宽度：恢复上次尺寸 + 绑定两条分隔条 + 视口变化时重新夹取。 */
+function initLayoutResizers(): void {
+  applyLayoutSize(fitLayoutSize(readLayoutSize()));
+  bindSplitter(document.getElementById('splitterSessions'), 'sessions');
+  bindSplitter(document.getElementById('splitterSide'), 'side');
+  let raf = 0;
+  window.addEventListener('resize', () => {
+    if (raf) return;
+    raf = window.requestAnimationFrame(() => {
+      raf = 0;
+      const cur = currentLayoutSize();
+      const next = fitLayoutSize(cur);
+      if (next.sessions !== cur.sessions || next.side !== cur.side) {
+        applyLayoutSize(next);
+        saveLayoutSize(next);
+      }
+    });
+  });
+}
+
 async function boot(): Promise<void> {
   bind();
+  initLayoutResizers();
   const params = new URLSearchParams(location.search);
   const fromUrl = params.get('session') || '';
   const saved = fromUrl || localStorage.getItem('continuousagent.session') || localStorage.getItem('gameagent.session') || '';
@@ -1612,8 +2697,11 @@ async function boot(): Promise<void> {
     toast('加载状态失败: ' + (e instanceof Error ? e.message : String(e)), true);
   }
   if (params.get('settings') === '1') {
-    buildSettings();
-    $('settingsOverlay').classList.remove('hidden');
+    openSettings();
+  }
+  // 初始化提示：还没添加任何模型时，提醒先去「设置 → 多模型」添加
+  if (state && !hasModelConfigured()) {
+    toast('还没有添加模型：请在「⚙ 设置」→「多模型」点「+ 添加模型」，填模型名、API 地址与密钥后再开始对话。');
   }
   connectEvents();
   void refreshWindows();

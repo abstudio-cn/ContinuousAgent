@@ -13,6 +13,11 @@
     "smoke": "node scripts/tool-smoke.mjs",
     "test:history": "node scripts/history-sequence-test.mjs",
     "test:history-400": "node scripts/history-400-repro.mjs",
+    "test:exec-timeout": "node scripts/exec-timeout-force-test.mjs",
+    "test:native": "node scripts/native-resilience-test.mjs",
+    "probe:native": "node scripts/native-probe.mjs",
+    "test:plugins": "node scripts/plugin-test.mjs",
+    "test:plugins-manage": "node scripts/plugin-manage-test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "dependencies": {},

@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 function asciiJson(value) {
     return JSON.stringify(value).replace(/[\u0080-\uffff]/g, (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
 }
+/** 桥接异常退出后的重启退避：1s → 2s → 4s → 8s → 16s（上限）。 */
+const RESTART_BASE_MS = 1000;
+const RESTART_MAX_MS = 16_000;
 function hostScript() {
     const here = path.dirname(fileURLToPath(import.meta.url));
     // dist/server/native.js -> web/scripts/native-host.ps1
@@ -28,7 +31,51 @@ export class NativeBridge {
     lastError = '';
     buffer = '';
     starting = null;
+    /** 主动关闭中：此时退出事件不应触发自动重启。 */
+    stopping = false;
+    restartTimer = null;
+    restartAttempts = 0;
+    onChange = null;
     supported = process.platform === 'win32';
+    /** 供诊断/测试读取当前宿主进程号。 */
+    get pid() {
+        return this.child?.pid ?? null;
+    }
+    /** 桥接可用性变化回调（上线/掉线/重启成功都会触发），用于推送前端横幅。 */
+    setChangeListener(fn) {
+        this.onChange = fn;
+    }
+    notify() {
+        try {
+            this.onChange?.(this.available, this.detail);
+        }
+        catch {
+            /* 回调异常不影响桥接本身 */
+        }
+    }
+    clearRestartTimer() {
+        if (this.restartTimer) {
+            clearTimeout(this.restartTimer);
+            this.restartTimer = null;
+        }
+    }
+    /**
+     * 桥接非正常退出后的自动重启：1s / 2s / 4s / 8s / 16s 指数退避（封顶）。
+     * 成功连上后把计数归零，所以偶发崩溃能立刻恢复，反复崩溃也不会打满 CPU。
+     */
+    scheduleRestart() {
+        if (!this.supported || this.stopping || this.restartTimer)
+            return;
+        const attempt = this.restartAttempts++;
+        const delay = Math.min(RESTART_MAX_MS, RESTART_BASE_MS * 2 ** Math.min(attempt, 4));
+        this.restartTimer = setTimeout(() => {
+            this.restartTimer = null;
+            if (this.stopping)
+                return;
+            void this.start().catch(() => undefined);
+        }, delay);
+        this.restartTimer.unref?.();
+    }
     get available() {
         return this.supported && this.child !== null && this.ready;
     }
@@ -46,6 +93,20 @@ export class NativeBridge {
             return true;
         if (this.starting)
             return this.starting;
+        this.stopping = false;
+        this.clearRestartTimer();
+        // 上一代 child 存在却未就绪（探活失败 / 半死）：先清掉再重启，避免留下孤儿进程
+        if (this.child) {
+            const stale = this.child;
+            this.child = null;
+            this.ready = false;
+            try {
+                stale.kill();
+            }
+            catch {
+                /* ignore */
+            }
+        }
         this.starting = new Promise((resolve) => {
             const script = hostScript();
             if (!fs.existsSync(script)) {
@@ -68,6 +129,11 @@ export class NativeBridge {
             }
             this.child = child;
             this.buffer = '';
+            // stdin 出错（桥接刚死时写管道会 EPIPE）必须吞掉：'error' 事件是异步派发的，
+            // 外层 try/catch 抓不到，漏了它会变成 uncaughtException 把整个服务带崩。
+            child.stdin.on('error', () => {
+                /* ignore */
+            });
             child.stdout.setEncoding('utf8');
             child.stdout.on('data', (chunk) => this.onData(chunk));
             child.stderr.setEncoding('utf8');
@@ -77,6 +143,9 @@ export class NativeBridge {
                     this.lastError = text.slice(0, 500);
             });
             child.on('exit', (code) => {
+                // 只认「当前这一代」child：重启时旧 child 的迟到退出事件不能影响新连接
+                if (this.child !== child)
+                    return;
                 this.child = null;
                 this.ready = false;
                 if (code !== 0)
@@ -86,19 +155,26 @@ export class NativeBridge {
                     p.reject(new Error('原生桥接已退出'));
                 }
                 this.pending.clear();
+                this.notify();
+                if (!this.stopping)
+                    this.scheduleRestart();
             });
             child.on('error', (err) => {
                 this.lastError = '原生桥接错误: ' + err.message;
             });
-            const probe = this.request('ping', {}, 20_000);
+            // 探活必须走 send()：request() 会先判 available 再调 start()，在这里会自锁
+            const probe = this.send('ping', {}, 20_000);
             probe.then(() => {
                 this.ready = true;
                 this.lastError = '';
+                this.restartAttempts = 0;
                 settled = true;
+                this.notify();
                 resolve(true);
             }).catch((err) => {
                 if (!settled) {
                     this.lastError = '原生桥接初始化失败: ' + err.message;
+                    this.notify();
                     resolve(false);
                 }
             });
@@ -134,8 +210,23 @@ export class NativeBridge {
                 pending.reject(new Error(String(msg.error || '原生命令失败')));
         }
     }
-    request(cmd, args = {}, timeoutMs = 30_000) {
-        return new Promise((resolve, reject) => {
+    /**
+     * 对外的请求入口：桥接不在线时先尝试重连（含崩溃后的自动重启），
+     * 这样任何一次工具调用都能把桥接「拉起来」，而不是永久卡在不可用状态。
+     */
+    async request(cmd, args = {}, timeoutMs = 30_000) {
+        if (this.stopping)
+            throw new Error('原生桥接已关闭');
+        if (!this.available) {
+            const ok = await this.start();
+            if (!ok)
+                throw new Error(this.lastError || '原生桥接未运行');
+        }
+        return this.send(cmd, args, timeoutMs);
+    }
+    /** 只把一行请求写进宿主并等应答，不做重连（内部使用，避免 start() 递归调 request）。 */
+    send(cmd, args = {}, timeoutMs = 30_000) {
+        const promise = new Promise((resolve, reject) => {
             const child = this.child;
             if (!child || !child.stdin.writable) {
                 reject(new Error(this.lastError || '原生桥接未运行'));
@@ -156,6 +247,11 @@ export class NativeBridge {
                 reject(err instanceof Error ? err : new Error(String(err)));
             }
         });
+        // 影子 catch：pending 请求可能在调用方已经放弃（用户中断/上层超时）之后才被 reject，
+        // 那种「无人接收」的 rejection 会升级成 unhandledRejection，直接把整个服务进程打崩。
+        // 挂一个空的 catch 只是给引擎一个 handler，返回的仍是原来的 promise，await 方照常拿到异常。
+        promise.catch(() => undefined);
+        return promise;
     }
     async listWindows() {
         const data = await this.request('list-windows', {}, 20_000);
@@ -232,6 +328,8 @@ export class NativeBridge {
         await fs.promises.unlink(file).catch(() => undefined);
     }
     stop() {
+        this.stopping = true;
+        this.clearRestartTimer();
         try {
             this.child?.stdin.write(asciiJson({ id: ++this.seq, cmd: 'shutdown', args: {} }) + '\n');
         }

@@ -199,11 +199,13 @@ npm run build
 npm start                     # 默认 http://127.0.0.1:7800
 ```
 
-1. 打开 <http://127.0.0.1:7800>，在「设置 → 接口与模型」填 OpenAI 兼容地址 / Key / 模型名；
+1. 打开 <http://127.0.0.1:7800>，在「设置 → 多模型」填 OpenAI 兼容地址 / Key / 模型名；
 2. 要操作界面就点顶部「目标窗口」选一个进程；
 3. 写目标 → Enter → 它自己一轮轮推进，随时可中断，中断后从工作记录接着干。
 
-一键脚本：`.\start.ps1`（构建 + 启动 + 打开浏览器，支持 `-Port 8080 -NoBuild`）。
+一键脚本：`.\start-windows.ps1`（构建 + 启动 + 打开浏览器，支持 `-Port 8080 -NoBuild`）。首次运行会先做**运行环境检测**：确认 Node.js ≥ 20（口径来自 `package.json` 的 `engines.node`）与 `npm` 可用；缺失时自动安装（优先 `winget`，失败退回官方 MSI 静默安装，需要管理员权限）。只想检查不动系统用 `-CheckEnv`，不想自动装用 `-NoAutoInstall`。
+
+Linux / macOS 用 `start-linux.sh`（POSIX sh 编写，`sh start-linux.sh` 也能跑）：首次 `chmod +x start-linux.sh`，然后 `./start-linux.sh`（构建 + 前台启动），参数风格对应 `--port 8080 --no-build`；后台运行 `./start-linux.sh --daemon`，查状态 `--status`，停止 `--stop`，日志与 pid 落在数据目录（默认 `~/.config/ContinuousAgent`）。首次运行同样会检测 Node.js ≥ 20，缺失时用官方发行包自动装到 `~/.local/lib/node`（`CA_NODE_HOME` 可改）：**无需 root**、不改系统目录与 shell 配置，校验 SHA256 后仅对本次运行前置 PATH；只检测用 `--check-env`，禁止自动装用 `--no-auto-install`。
 
 **安全提示**：服务默认只监听 `127.0.0.1`，但它能在你的机器上移动鼠标、按键、读文件。**不要**直接暴露到公网；远程访问请走 SSH 隧道 / Tailscale，并设置 `CONTINUOUS_AGENT_TOKEN`。
 
@@ -224,6 +226,11 @@ npm start                     # 默认 http://127.0.0.1:7800
 
 ## 八、历史更新记录
 
+### 2026-11-19（工作区，未提交）
+
+- **历史对话快速搜索**：侧栏新增搜索框（可切「对话 / 全部」范围），输入即按关键词检索**所有历史会话**，结果按会话分组并带命中片段、关键词高亮；点结果直接跳到该会话并把命中的那条消息滚到屏幕中间闪一下。agent 侧新增工具 `search_sessions`，可在任务中自己翻过往会话做对比（比如「上次这个构建错误是怎么修的」）。检索是**纯只读**的：不建目录、不写模板、不改任何历史数据。语义上多关键词按空白拆分、**全部命中**才算命中（AND），大小写不敏感、中文按子串；`scope=chat`（默认）搜会话标题与对话正文，`scope=all` 再把工具输出与工作记录/笔记一起搜。为避免一次搜索把全部会话无界读入，设了「扫描会话数 / 每会话命中条数 / 返回分组数」三重上限与单条 200k 字符截断，超限时 `truncated=true` 如实透出。接口：`GET /api/sessions/search?q=&scope=chat|all&max=&per=`。回归：`node scripts/session-search-test.mjs`（61 项）。
+- **执行中插入对话**：任务正在跑（`running=true`）时，输入框不再被禁掉，按钮变「插入消息」；提交的内容会立即出现在时间线，并在**下一轮请求**并入历史继续执行，不必先中断再重开。实现上消息先入队 `pendingInjected`，只在**轮次边界**（`while` 顶部）并入 `history`——工具调用进行中插入会把 `assistant.tool_calls` 与对应 `tool` 结果拆散，服务端会判 400；`finally` 再补一次排空，保证运行结束时消息不丢。模型这轮已吐 `[[DONE]]` 但队列非空时改判继续跑，单轮模式同理。接口：新增 `POST /api/agent/message`，`/api/agent/start` 同会话运行中由 409 改为注入，异会话仍 409（保留「同时只跑一个会话」）。回归：`node scripts/inject-message-test.mjs`（54 项）。
+
 ### 2026-11-15（工作区，未提交）
 
 - **文档重写**：README 的说明侧重改为「可持续运行」——核心命题是**不做传统上下文压缩**（无摘要生成、无向量检索），而是把状态外置成磁盘上的工作记录/笔记/技巧库，做法对照真人工作方式（交接班、笔记本、留底稿、打卡收工）。文档内的用户路径统一写作 `%USERPROFILE%`，不再出现具体用户名。
@@ -240,6 +247,10 @@ npm start                     # 默认 http://127.0.0.1:7800
 - **`exec_command` 后台执行**：`background=true` / `wait_ms` 立即返回任务 ID，配 `exec_output`（增量输出）与 `exec_kill`（整树终止）。
 - **客户端 Markdown 重写**：`renderMarkdown` + `MarkdownStream` 增量渲染，先转义再生成 HTML，支持表格 / 任务列表 / 嵌套列表 / 代码块复制，流式输出与一次性渲染逐字符一致。
 - **完成标记**：服务端不再生成「收到完成标记」这类文案，历史旧文案在渲染层剥离（不改写磁盘数据）。
+- **白天主题**：设置面板新增「外观」分区，可选「深色（默认）/ 白天」，选中即时预览、点保存落库到 `settings.json` 的 `theme` 字段。实现上深色规则一行未动，只在 `public/styles.css` 末尾追加一块 `html[data-theme="light"]` 覆盖（先重定义 13 个设计变量，再逐条覆盖 98 条含色规则里需要变色的项）；`index.html` 加一段内联脚本读 `localStorage` 镜像并提前 `setAttribute`，避免刷新时先深后浅地闪一下。
+- **`exec_command` 超时兜底**：超时原来只做 `killTree()`，结果仍等子进程 `close` 事件；一旦孙进程（例如浏览器派生的 crashpad/gpu 子进程）逃出进程树还占着 stdout 管道，`close` 永不到来，工具调用就会一直挂着（实测 `timeout_ms=180000` 却等了 571027ms）。现在击杀后布防 3 秒宽限期，超期强制结算并在结果里注明「输出管道未关闭，已强制结算」。回归：`node scripts/exec-timeout-force-test.mjs`（17 项，含孙进程占管道的复现场景）。
+- **插件独立开关与删除**：原来只能改 `plugin.json` 里的 `enabled` 手动关插件、删插件只能自己删目录。现在设置面板「插件」分区每个插件一行，带「开启/关闭」与「删除」：① 开关状态落在 `<数据目录>/plugins_state.json`（`{version,overrides:{id:bool}}`，`tmp+rename` 原子写），**用户显式设置优先于清单声明**，`manifestEnabled` 与 `enabled` 在界面分开显示，被覆盖时额外标注「开关来源：手动设置」；② 切换后立即 `reload()` 重建工具清单，关闭的插件工具从 `catalog()` 与提示词里同时撤下，无需重启；③ 加载失败的插件不允许开启；④ 删除前 `window.confirm` 二次确认，动作是**移入回收站** `<数据目录>/plugins_trash/<目录名>__<时间戳>`（保留 `plugin.json`，可手工拷回），不是物理删除；删除时只允许操作插件根目录的**直接子目录**（防路径越界），并清掉该插件的开关记录。接口：`POST /api/plugins/toggle {id,enabled}`、`POST /api/plugins/remove {id}`，两者都广播 `{type:'plugins'}`。回归：`node scripts/plugin-manage-test.mjs`（81 项）、`e2e` 隔离实例 38 项。
+- **原生桥接自愈**：界面上的「原生控制不可用：原生桥接进程退出，代码 1」原来一次偶发就永久停摆——`NativeBridge.start()` 只在启动时调一次，`exit` 之后只清状态、永不重连，非得重启服务。现在：掉线后按 1s/2s/4s/8s/16s 指数退避自动重启，连上即把计数归零；`request()` 改为「不在线就先重连」，任何一次工具调用都能把桥拉起来；可用性变化通过 `setChangeListener` 广播给前端，横幅会自己消失。同时修掉两个会拖垮服务的隐患：`stdin` 的 EPIPE（`'error'` 异步派发，外层 `try/catch` 抓不到）与「请求 promise 在调用方已放弃后才被 reject」导致的 unhandledRejection。排查：`node scripts/native-probe.mjs`（逐命令压测宿主脚本）、`node scripts/native-resilience-test.mjs`（22 项，用 `taskkill /F` 复现线上故障签名）。
 
 ### 2026-11-14（git 提交）
 

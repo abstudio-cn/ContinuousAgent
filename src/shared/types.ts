@@ -1,5 +1,7 @@
 /** 前后端共用的数据模型。浏览器端只接收脱敏后的设置。 */
 
+import type { SceneId } from './scenes.js';
+
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ToolCall {
@@ -18,6 +20,11 @@ export interface ChatMessage {
   images?: string[] | null;
   /** 阅后即焚：该消息的截图已被模型读过 */
   imageConsumed?: boolean;
+  /**
+   * 任务首轮保留标记：该消息属于「本次任务的第一轮」，裁剪历史时必须保留，
+   * 直到任务输出完成标记为止。仅服务端内部使用，不发进请求体。
+   */
+  pinned?: boolean;
 }
 
 /** 用户随消息一起提交的附件（图片或文本）。 */
@@ -35,6 +42,52 @@ export interface Attachment {
   imageId?: string;
 }
 
+/** 界面主题：dark 深色（默认）/ light 白天 */
+export type ThemeName = 'dark' | 'light';
+
+/**
+ * 一套可切换的模型配置（多模型）。
+ * 密钥只保存在服务端，下发给浏览器时换成 hasApiKey 标记。
+ *
+ * 除 id / name / apiBaseUrl / model 外，其余各项都是**可选覆盖**：
+ * 缺省（undefined / 空串）= 沿用全局设置里的同名项，语义与「全局值」完全一致；
+ * 一旦填了就只用本模型自己的值。这样每套模型能表达「和全局不同」的思考强度、
+ * 采样参数与计价口径，而不填的模型行为与过去零差异。
+ */
+export interface ModelProfile {
+  /** 稳定 id，界面与被选中的记录都用它（形如 m1 / m-abc123） */
+  id: string;
+  /** 显示名；留空时界面回退显示 model */
+  name: string;
+  /** API 地址；留空表示沿用上面的全局 apiBaseUrl */
+  apiBaseUrl: string;
+  /** 模型名称，必填 */
+  model: string;
+
+  // ---- 以下为逐项覆盖，缺省 = 沿用全局 ----
+  /** 思考强度：auto|minimal|low|medium|high（auto = 不发送 reasoning_effort） */
+  reasoningEffort?: string;
+  /** Temperature（0~2） */
+  temperature?: number;
+  /** 最大输出 tokens（256~384000） */
+  maxOutputTokens?: number;
+  /** true = 关闭模型思考（请求带 chat_template_kwargs.enable_thinking=false） */
+  disableThinking?: boolean;
+  /** 缓存命中输入单价（每百万 tokens） */
+  priceCacheHit?: number;
+  /** 缓存未命中输入单价（每百万 tokens） */
+  priceInput?: number;
+  /** 输出单价（每百万 tokens） */
+  priceOutput?: number;
+  /** 货币符号（如 ¥ / $） */
+  priceCurrency?: string;
+}
+
+/** 下发给浏览器的模型配置：不含密钥，只标记是否已保存。 */
+export interface PublicModelProfile extends ModelProfile {
+  hasApiKey: boolean;
+}
+
 export interface AppSettings {
   // API
   apiBaseUrl: string;
@@ -42,6 +95,23 @@ export interface AppSettings {
   reasoningEffort: string; // auto|minimal|low|medium|high
   temperature: number;
   maxOutputTokens: number;
+  /**
+   * 关闭模型思考（本地小模型加速）：请求里带 chat_template_kwargs.enable_thinking=false。
+   * 思考 token 计入输出且按顺序逐字生成，在 10 tok/s 级本地模型上是最大的延迟来源；
+   * 关掉后单轮输出量可降约 90%。默认关闭，不影响云端服务商。
+   */
+  disableThinking: boolean;
+
+  /**
+   * 多模型：可切换的模型配置列表。列表为空或 activeModelId 为空时，
+   * 一律沿用上面的 apiBaseUrl / apiKey / model，行为与没有多模型时完全一致。
+   */
+  modelProfiles: ModelProfile[];
+  /** 当前生效的模型配置 id；空字符串表示不启用多模型 */
+  activeModelId: string;
+
+  // 外观：深色（默认）/ 白天
+  theme: ThemeName;
 
   // 工作空间
   workspacePath: string;
@@ -71,6 +141,11 @@ export interface AppSettings {
 
   /** 是否把《全局技巧库》附加到提示词（跨会话共享的工具技巧，写入时自动脱敏）。默认开启。 */
   globalTipsEnabled: boolean;
+
+  /** 工具场景：决定注入哪一套工具指引、以及工具描述按哪一档增强。默认 'general'（不注入、不增强）。 */
+  toolScene: SceneId;
+  /** 是否注入场景指引（关闭后提示词与没有场景功能时逐字一致）。默认开启。 */
+  sceneGuideEnabled: boolean;
 
   // 运行
   continuousMode: boolean;
@@ -113,7 +188,9 @@ export interface AppSettings {
 }
 
 /** 浏览器拿到的设置：密钥只以“已保存/未保存”呈现。 */
-export interface PublicSettings extends AppSettings {
+export interface PublicSettings extends Omit<AppSettings, 'modelProfiles'> {
+  /** 多模型配置（已去掉各模型自己的密钥） */
+  modelProfiles: PublicModelProfile[];
   hasApiKey: boolean;
   hasCloudTtsApiKey: boolean;
 }
@@ -147,6 +224,49 @@ export interface SessionInfo {
   running: boolean;
   recordLength: number;
   notesLength: number;
+}
+
+/** 历史检索范围：chat=标题 + 对话正文；all=再加工具产物与工作记录/笔记。 */
+export type SessionSearchScope = 'chat' | 'all';
+
+/** 一条历史检索命中。 */
+export interface SessionSearchHit {
+  /** 时间线条目 id（记录/笔记/标题命中为空串） */
+  itemId: string;
+  /** 命中来源：session-title / 各 ChatItemKind / record / notes */
+  kind: string;
+  /** 条目时间标签（标题与文档命中为空串） */
+  time: string;
+  /** 命中的关键词（均已小写化） */
+  matched: string[];
+  /** 命中片段（已折叠空白、两端可能带省略号） */
+  snippet: string;
+}
+
+/** 按会话分组的历史检索结果。 */
+export interface SessionSearchGroup {
+  sessionId: string;
+  title: string;
+  updatedAt: number;
+  /** 该会话内命中条目数（可能大于 hits.length） */
+  hitCount: number;
+  /** 命中的关键词个数（用于排序，越大越相关） */
+  score: number;
+  hits: SessionSearchHit[];
+}
+
+export interface SessionSearchReport {
+  query: string;
+  /** 拆分后的关键词（小写） */
+  terms: string[];
+  scope: SessionSearchScope;
+  /** 实际扫描的会话数 */
+  scanned: number;
+  /** 命中条目总数（截断前） */
+  totalHits: number;
+  groups: SessionSearchGroup[];
+  /** 是否因上限被截断 */
+  truncated: boolean;
 }
 
 export interface ChatItem {
@@ -209,7 +329,12 @@ export interface PluginInfo {
   /** 插件用途：审计时必须展示 */
   purpose: string;
   dir: string;
+  /** 实际生效的开关（用户独立开关覆盖清单声明后的结果） */
   enabled: boolean;
+  /** 清单里声明的开关（作者默认值，只读） */
+  manifestEnabled: boolean;
+  /** 用户是否显式设置过该插件的开关（true 时 enabled 来自用户） */
+  overridden: boolean;
   /** 空串表示正常；否则是加载失败原因（该插件不会提供任何工具） */
   error: string;
   tools: PluginToolInfo[];
@@ -222,6 +347,8 @@ export interface PluginState {
   dir: string;
   /** 已写入审计日志的调用次数 */
   auditCount: number;
+  /** 删除插件时的回收站目录（与插件目录同级） */
+  trashDir: string;
   items: PluginInfo[];
 }
 
@@ -241,6 +368,14 @@ export interface AgentStatus {
   hasSession: boolean;
 }
 
+/** 会话级工具场景的生效值（未单独设置的字段回落全局设置） */
+export interface SessionSceneState {
+  toolScene: SceneId;
+  sceneGuideEnabled: boolean;
+  /** 两项都没有会话级覆盖时为真（此时完全跟随全局设置） */
+  inherited: boolean;
+}
+
 export type ServerEvent =
   | { type: 'state'; sessionId: string; status: AgentStatus }
   | { type: 'item_add'; sessionId: string; item: ChatItem }
@@ -253,6 +388,7 @@ export type ServerEvent =
   | { type: 'sessions'; sessions: SessionInfo[] }
   | { type: 'grants'; sessionId: string; grants: string[] }
   | { type: 'readGrants'; sessionId: string; readGrants: string[] }
+  | { type: 'scene'; sessionId: string; scene: SessionSceneState }
   | { type: 'plugins'; plugins: PluginState };
 
 export interface AppState {
@@ -261,6 +397,8 @@ export interface AppState {
   grants: string[];
   /** 本会话已授权的额外可读目录（仅在严格读取模式下起作用） */
   readGrants: string[];
+  /** 本会话生效的工具场景（会话级优先，未设置时回落全局默认） */
+  scene: SessionSceneState;
   sessions: SessionInfo[];
   settings: PublicSettings;
   status: AgentStatus;

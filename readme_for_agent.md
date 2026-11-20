@@ -13,22 +13,51 @@
 ## 快速开始
 
 ```powershell
-cd C:\Users\abstudio\Documents\ContinuousAgent
+cd "$env:USERPROFILE\Documents\ContinuousAgent"   # cmd.exe 写法：cd %USERPROFILE%\Documents\ContinuousAgent
 npm install
-npm start            # 构建产物需先 npm run build（或直接 .\start.ps1）
+npm start            # 构建产物需先 npm run build（或直接 .\start-windows.ps1 / ./start-linux.sh）
 ```
 
 一键脚本（构建 + 启动 + 打开浏览器）：
 
 ```powershell
-.\start.ps1              # 默认 7800 端口
-.\start.ps1 -Port 8080 -NoBuild
+.\start-windows.ps1      # 默认 7800 端口
+.\start-windows.ps1 -Port 8080 -NoBuild
+```
+
+Linux / macOS 用参数风格对应的 `start-linux.sh`（POSIX sh 编写，`sh start-linux.sh` 也能跑，不依赖 bash）：
+
+```sh
+chmod +x start-linux.sh          # 首次使用给执行位
+./start-linux.sh                 # 构建 + 前台启动，默认 7800
+./start-linux.sh --port 8080 --no-build
+./start-linux.sh --host 0.0.0.0  # 需要局域网访问时
+./start-linux.sh --daemon        # 后台运行（nohup），日志进数据目录
+./start-linux.sh --status        # 查看状态
+./start-linux.sh --stop          # 停止后台实例
+```
+
+两个脚本首次运行都会先做**运行环境检测**：确认 Node.js ≥ 20（口径来自 `package.json` 的 `engines.node`）与 `npm` 可用。缺失或版本过低时自动安装：
+
+- **Windows**：优先 `winget install --id OpenJS.NodeJS.LTS`，失败则下载官方 MSI 静默安装（需管理员权限；非管理员会给出提示与下载地址，不会静默失败）
+- **Linux/macOS**：下载 nodejs.org 官方发行包（`.tar.gz`，避免依赖 xz），校验 SHA256 后解压到 `~/.local/lib/node`（`CA_NODE_HOME` 可改），**无需 root**；只对本次运行前置 PATH，不动系统目录与 shell 配置
+
+安装前会打印「检测到什么 / 要装到哪里」，安装完成后重新校验一遍才继续构建。需要排障时：
+
+```sh
+./start-linux.sh --check-env         # 只检测环境，不安装也不启动（可用=0，不可用=1）
+./start-linux.sh --no-auto-install   # 缺 Node.js 时直接报错，不自动装
+```
+
+```powershell
+.\start-windows.ps1 -CheckEnv        # 只检测环境（会打印修复方案与官方安装包地址）
+.\start-windows.ps1 -NoAutoInstall   # 缺 Node.js 时报错，不自动装
 ```
 
 然后：
 
 1. 打开 <http://127.0.0.1:7800>
-2. 右上「设置 → 接口与模型」填 OpenAI 兼容地址、Key、模型名
+2. 右上「设置 → 多模型」填 OpenAI 兼容地址、Key、模型名
 3. （需要操作 GUI 时）顶部「目标窗口」下拉选择目标进程（列出 PID / 进程 / 客户区尺寸）
 4. 输入框写托管目标，Enter 或「开始托管」
 5. 随时「中断运行」（页面内快捷键 `F12` / `Ctrl+Shift+X`；浏览器无法注册全局热键）
@@ -62,7 +91,8 @@ npm start            # 构建产物需先 npm run build（或直接 .\start.ps1�
 ```
 web/
 ├── package.json / tsconfig.json / tsconfig.client.json
-├── start.ps1                    # 一键构建 + 启动
+├── start-windows.ps1            # 一键构建 + 启动（Windows，含环境检测/自动安装）
+├── start-linux.sh               # 一键构建 + 启动（Linux/macOS，POSIX sh，含环境检测/自动安装）
 ├── public/
 │   ├── index.html
 │   └── styles.css               # 深色主题
@@ -104,6 +134,7 @@ web/
 - 坐标：目标窗口**客户区像素**，左上 (0,0)；截图只用于观察，可能等比缩放。
 - 读：本机任意路径；写/删：仅工作空间；删除进 `<工作空间>/.trash`（7 天可恢复）。
 - 截图默认转 JPEG(60) 且宽度上限 1280，只带最近 2 张图，读过即焚。
+- 历史检索：`search_sessions`（必填 `query`，可选 `scope=chat|all`、`limit`）——跨会话翻过往对话，用来看「上次类似问题是怎么处理的」；只读，不改任何历史数据。
 
 ## 输入与热键
 
@@ -156,6 +187,7 @@ web/
 | --- | --- | --- |
 | GET | `/api/state?session=<id>` | 该会话的设置（脱敏）、运行状态、目标窗口、记录、笔记、时间线 |
 | GET | `/api/sessions` | 会话列表（含运行状态与字数） |
+| GET | `/api/sessions/search?q=&scope=chat\|all&max=&per=` | **历史对话检索**（只读）：多关键词按空白拆分、**全部命中**才算命中，大小写不敏感、中文按子串；返回按会话分组的命中片段；`max`/`per` 限分组数与每会话片段数，被截断时 `truncated=true` |
 | POST | `/api/sessions` | 新建会话 `{title}` |
 | POST | `/api/sessions/:id/rename` \| `/delete` | 重命名 / 删除（记录移入 .trash） |
 | GET | `/api/events` | SSE：`state/item_add/item_update/clear/record/notes/target/native` |
@@ -163,7 +195,8 @@ web/
 | GET | `/api/windows` | 可见窗口列表 |
 | POST | `/api/window/select` | `{pid}` 或 `{title}` |
 | POST | `/api/window/clear` | 清除目标 |
-| POST | `/api/agent/start` \| `stop` \| `reset` \| `clear-timeline` | 运行控制（需带 `sessionId`） |
+| POST | `/api/agent/start` \| `stop` \| `reset` \| `clear-timeline` | 运行控制（需带 `sessionId`）；同会话**运行中**调 `start` 不再 409，改为把 `prompt` 当作插入消息 |
+| POST | `/api/agent/message` | **执行中插入对话**：`{sessionId, prompt, attachments?}`。运行中 → 注入并回 `{ok, injected:true, turn}`；未运行 → `409 {notRunning:true}`（客户端退化走 start） |
 | POST | `/api/test-connection` | 模型连通性 |
 | POST | `/api/tts` | 云端 TTS 代理（Key 不出服务端） |
 | GET | `/api/images/:id` | 工具截图 |
@@ -178,6 +211,12 @@ node scripts/tool-smoke.mjs GameAgent
 
 # 会话隔离：在 A 会话跑一轮，确认 B 会话记录不变
 node scripts/session-test.mjs --url http://127.0.0.1:7789
+
+# 执行中插入对话：运行中注入消息 → 下一轮请求生效（隔离实例 + SSE mock，无需真实模型）
+npm run build && node scripts/inject-message-test.mjs
+
+# 历史对话检索：search() 语义 + 工具层 + HTTP 路由 + 只读校验（61 项）
+npm run build && node scripts/session-search-test.mjs
 
 # 端到端：需要先启动 mock 或真实模型
 npm start
@@ -196,6 +235,8 @@ node scripts/selftest.mjs --title GameAgent --prompt "原生链路自检"
 - Windows OCR 依赖系统语言包，识别率与字号、缩放有关；截图上限 2400 宽。
 - 浏览器不能注册全局热键，中断只在页面聚焦时有效。
 - 同一时间只允许**一个会话**运行（否则两个会话会抢同一套键鼠），切换会话不会中断正在跑的会话。
+- 执行中的消息插入是「下一轮请求生效」：当前轮请求已经发出，无法中途改它的上下文；界面文案也按这个口径写。
+- 历史检索有上限：默认最多扫 120 个会话、每会话返回 3 条片段、共 20 个分组，单条文本只扫前 200k 字符；结果被裁剪时 `truncated=true`，此时「另有 N 条命中未列出」会在每组下方标出。
 - 截图/目标窗口是机器级状态，不随会话切换而重置。
 - 页面刷新会重放服务端时间线；服务重启后对话历史（内存）丢失，但工作记录/笔记在磁盘上不受影响。
 - 不做反检测：在线竞技游戏使用自动化可能违反服务条款（游戏场景仍可用，但请自行判断合规性）。
@@ -211,6 +252,7 @@ node scripts/selftest.mjs --title GameAgent --prompt "原生链路自检"
 - 新增**思考强度**下拉（reasoning_effort：auto/minimal/low/medium/high），改动立即存到服务端设置。
 - 新增 **Token 输入/输出** 显示：顶栏汇总 + 输入区实时计量 + 每条回复脚注的本轮用量。
 - 品牌、页面标题、系统提示词、数据目录统一改为 **ContinuousAgent**。
+- 侧栏新增**历史对话搜索**：输入关键词即跨会话检索，结果按会话分组、带命中片段与关键词高亮，点一下直接跳到该会话并把命中的那条消息滚到屏幕中间闪一下；右上角可切「对话 / 全部」范围（全部含工具输出与工作记录/笔记）。`Esc` 清空恢复会话列表。
 
 ### 工具（对齐 OpenClaw agent 能力）
 
@@ -249,11 +291,12 @@ node scripts/selftest.mjs --title GameAgent --prompt "原生链路自检"
 
 ### 完成标记（让 agent 自己停止）
 
-持续托管模式默认会一直续跑（直到 `maxTurns`，默认 500）。现在模型可以在真正完工时主动收尾：
+持续托管模式默认会一直续跑（直到 `maxTurns`，默认 500）。现在模型可以在真正完工时主动收尾，或在「只有用户能定」的分叉上主动中断等答复：
 
 - 系统提示词要求：确认全部要求已完成并验证过 → 先 `update_work_record` 写最终状态 → 在回复**最后单独一行**输出 `[[DONE]]`。
 - 服务端只在「本轮没有任何工具调用」时才认这个标记，并从正文里剥掉，状态变为 **已完成**，自动续跑立即停止，页面弹出「✅ 模型确认任务完成」。
 - 防误判：标记必须在消息最末尾且不在未闭合的代码块里；出现在中间、后面还有内容、或在代码块示例中都不算。
+- 需要用户做选择时也走这个标记：遇到方案取舍 / 口径不明 / 是否执行不可逆或有外部影响的操作 / 缺必要信息时，先只读侦察把事实摆清，把 2~3 个明确选项（各写清影响与代价）列给用户并给出推荐，然后在回复**最后单独一行**输出 `[[DONE]]` 中断自动续跑，等用户答复。这不算「提前结束」：用户答复后从当时状态继续，不重复已完成步骤。
 - 单轮模式（`continuousMode=false`）本来就会在完成一轮后停止，标记同样会显示为“已完成”。
 
 ### 重复工具调用熔断（模型原地打转就刹车）

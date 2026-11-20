@@ -81,16 +81,52 @@ export function sanitizeHistory(messages) {
     }
     return { messages: out, droppedToolMessages, synthesizedToolResults, remappedToolCallIds };
 }
+/** 首轮最多固定保留多少条（防止首轮异常庞大时既钉住又吃掉整个预算）。 */
+const MAX_PINNED_MESSAGES = 40;
 /**
- * 按条数裁剪历史：保留首条用户需求 + 最近 max 条，裁剪点必须落在一个
- * 完整消息组的起点（优先 user 边界），不能把 assistant.tool_calls 与它的
- * tool 结果拆散；最后再过一遍 sanitizeHistory 兜底。
+ * 首轮保留块超限时按「完整消息组」收缩：组 = 一条 user/普通 assistant，
+ * 或「带 tool_calls 的 assistant + 它的全部 tool 结果」。
+ * 不能简单从尾部逐条剔除——那会把「assistant+tool 交替」的长块一路削到只剩首条，
+ * 白白浪费预算；按组累加则能保住尽量多的完整回合，且截断点永远合法。
+ */
+function capPinned(list, cap) {
+    let end = 0;
+    let i = 0;
+    while (i < list.length) {
+        const start = i;
+        const m = list[i];
+        i++;
+        if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+            // 吞掉这组的全部工具结果，保证不把 tool_calls 与结果拆开
+            while (i < list.length && list[i].role === 'tool')
+                i++;
+        }
+        if (i > cap && start > 0)
+            break; // 这一组会超限：停在上一个完整边界
+        end = i;
+    }
+    return list.slice(0, end);
+}
+/**
+ * 按条数裁剪历史：保留首条用户需求 + 本次任务首轮（pinned）+ 最近 max 条，
+ * 裁剪点必须落在一个完整消息组的起点（优先 user 边界），不能把
+ * assistant.tool_calls 与它的 tool 结果拆散；最后再过一遍 sanitizeHistory 兜底。
  */
 export function trimHistoryMessages(messages, max) {
     const cleaned = sanitizeHistory(messages).messages;
     const limit = Math.min(400, Math.max(2, Math.trunc(Number.isFinite(max) ? max : 24)));
     if (cleaned.length <= limit)
         return { messages: cleaned, removed: 0 };
+    // 任务首轮保留：这些消息（本次任务的第一轮对话）不参与「最近 N 条」的淘汰，
+    // 否则长任务跑到几十轮后，最初的用户需求会被裁掉，模型只能靠工作记录猜任务是什么。
+    const pinnedAll = cleaned.filter((m) => m.pinned === true);
+    const pinned = pinnedAll.length > MAX_PINNED_MESSAGES
+        ? capPinned(pinnedAll, MAX_PINNED_MESSAGES)
+        : pinnedAll;
+    const pinnedSet = new Set(pinned);
+    // 首轮块是「额外保留」，不占「最近 N 条」的预算：用户设置 historyMaxMessages
+    // 的语义必须稳定为「最近 N 条照常保留」，不能因为钉住首轮而让最近窗口缩水。
+    // 膨胀上限由 MAX_PINNED_MESSAGES 与 llm.ts 的 token 预算兜住。
     const target = cleaned.length - limit;
     let cut = -1;
     // 1) 优先切在 user 边界：语义最完整（整个回合一起保留/丢弃）
@@ -123,7 +159,28 @@ export function trimHistoryMessages(messages, max) {
     }
     if (cut <= 1)
         return { messages: cleaned, removed: 0 };
-    const next = [cleaned[0], ...cleaned.slice(cut)];
-    return { messages: sanitizeHistory(next).messages, removed: cut - 1 };
+    // 拼装：首轮保留块 + 最近窗口；被裁掉的中间段跳过。
+    // 有 pinned 时不再单独保留 cleaned[0]：首轮块已经承载了「本次任务的需求」，
+    // 而 cleaned[0] 往往是上一个任务的首条消息，钉住它只是白占预算。
+    // 窗口内若还有 pinned（首轮恰好落在窗口内），从窗口里剔除，避免同一消息出现两次。
+    const window = cleaned.slice(cut).filter((m) => !pinnedSet.has(m));
+    const next = pinned.length > 0 ? [] : [cleaned[0]];
+    const seen = new Set(next);
+    for (const m of pinned) {
+        if (seen.has(m))
+            continue;
+        seen.add(m);
+        next.push(m);
+    }
+    for (const m of window) {
+        if (seen.has(m))
+            continue;
+        seen.add(m);
+        next.push(m);
+    }
+    const removed = cleaned.length - next.length;
+    if (removed <= 0)
+        return { messages: cleaned, removed: 0 };
+    return { messages: sanitizeHistory(next).messages, removed };
 }
 //# sourceMappingURL=history.js.map

@@ -158,6 +158,7 @@ function loadPlugin(dirPath, fallbackId, defaultTimeout) {
         version: '',
         purpose: '',
         dir: dirPath,
+        manifestEnabled: false,
         enabled: false,
         tools: [],
         error: '',
@@ -194,7 +195,7 @@ function loadPlugin(dirPath, fallbackId, defaultTimeout) {
             seen.add(one.tool.globalName);
             tools.push(one.tool);
         }
-        return { id, name, version, purpose, dir: dirPath, enabled, tools, error: '' };
+        return { id, name, version, purpose, dir: dirPath, manifestEnabled: enabled, enabled, tools, error: '' };
     }
     catch (e) {
         return { ...base, error: '解析失败：' + msgOf(e) };
@@ -358,10 +359,102 @@ function spawnCollect(cmd, argv, opts) {
         child.on('close', (code) => finish(code ?? 0));
     });
 }
+/** 回收站目录名后缀用的时间戳（本地时间，秒级）。 */
+function trashStamp(d = new Date()) {
+    const p = (n) => (n < 10 ? '0' + n : String(n));
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+/**
+ * 单插件开关的持久化（默认 <数据目录>/plugins_state.json）。
+ * 只保存用户显式设置过的插件 id → 布尔值；清单里的 enabled 只是作者默认值。
+ */
+export class PluginSwitchStore {
+    file;
+    data = { version: 1, overrides: {} };
+    loaded = false;
+    lastError = '';
+    constructor(file) {
+        this.file = file;
+    }
+    get path() {
+        return this.file;
+    }
+    get loadError() {
+        return this.lastError;
+    }
+    /** 读盘（坏文件按空状态处理，不抛异常）。 */
+    load() {
+        this.loaded = true;
+        this.lastError = '';
+        try {
+            if (!fs.existsSync(this.file))
+                return;
+            const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+                return;
+            const raw = parsed.overrides;
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+                return;
+            const next = {};
+            for (const [k, v] of Object.entries(raw)) {
+                if (ID_RE.test(k) && typeof v === 'boolean')
+                    next[k] = v;
+            }
+            this.data = { version: 1, overrides: next };
+        }
+        catch (e) {
+            this.lastError = '插件开关状态读取失败：' + msgOf(e);
+            this.data = { version: 1, overrides: {} };
+        }
+    }
+    /** 取用户设置（undefined = 没有覆盖，沿用清单声明）。 */
+    get(id) {
+        if (!this.loaded)
+            this.load();
+        return Object.prototype.hasOwnProperty.call(this.data.overrides, id) ? this.data.overrides[id] : undefined;
+    }
+    get count() {
+        if (!this.loaded)
+            this.load();
+        return Object.keys(this.data.overrides).length;
+    }
+    /** 写入并落盘；返回是否成功。 */
+    set(id, enabled) {
+        if (!ID_RE.test(id))
+            return false;
+        if (!this.loaded)
+            this.load();
+        this.data.overrides[id] = enabled;
+        return this.save();
+    }
+    /** 删除插件后清掉它的开关记录。 */
+    forget(id) {
+        if (!this.loaded)
+            this.load();
+        if (!Object.prototype.hasOwnProperty.call(this.data.overrides, id))
+            return;
+        delete this.data.overrides[id];
+        this.save();
+    }
+    save() {
+        try {
+            fs.mkdirSync(path.dirname(this.file), { recursive: true });
+            const tmp = this.file + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8');
+            fs.renameSync(tmp, this.file);
+            return true;
+        }
+        catch (e) {
+            this.lastError = '写入插件开关状态失败：' + msgOf(e);
+            return false;
+        }
+    }
+}
 /** 插件注册表：加载清单、给出工具清单、执行（带审计前置于调用方）。 */
 export class PluginRegistry {
     root;
     defaultTimeout;
+    switches;
     plugins = [];
     byTool = new Map();
     errors = [];
@@ -373,9 +466,12 @@ export class PluginRegistry {
     /** 默认超时（跟设置联动） */
     defaultTimeout, 
     /** 核心工具名，用于防御性判重 */
-    coreToolNames = []) {
+    coreToolNames = [], 
+    /** 单插件开关的持久化（缺省则不覆盖清单声明） */
+    switches = null) {
         this.root = root;
         this.defaultTimeout = defaultTimeout;
+        this.switches = switches;
         this.coreNames = new Set(coreToolNames);
     }
     get directory() {
@@ -383,6 +479,13 @@ export class PluginRegistry {
     }
     get loadErrors() {
         return [...this.errors];
+    }
+    /** 删除插件时的回收站目录（与插件根目录同级，不参与扫描） */
+    get trashDirectory() {
+        return path.join(path.dirname(path.resolve(this.root)), 'plugins_trash');
+    }
+    get switchStore() {
+        return this.switches;
     }
     /** 重新扫描插件目录。无论发生什么都不抛异常。 */
     reload() {
@@ -426,13 +529,17 @@ export class PluginRegistry {
             catch (e) {
                 def = {
                     id: name, name, version: '', purpose: '', dir: path.join(this.root, name),
-                    enabled: false, tools: [], error: '加载异常：' + msgOf(e),
+                    manifestEnabled: false, enabled: false, tools: [], error: '加载异常：' + msgOf(e),
                 };
             }
             if (seenIds.has(def.id)) {
                 def = { ...def, enabled: false, tools: [], error: def.error || '插件 id 重复：' + def.id };
             }
             seenIds.add(def.id);
+            // 用户显式开关覆盖清单声明；加载失败的插件永远不允许被启用
+            const override = this.switches ? this.switches.get(def.id) : undefined;
+            if (typeof override === 'boolean' && !def.error)
+                def = { ...def, enabled: override };
             if (def.error)
                 errors.push(def.id + '：' + def.error);
             plugins.push(def);
@@ -462,6 +569,8 @@ export class PluginRegistry {
             purpose: p.purpose,
             dir: p.dir,
             enabled: p.enabled,
+            manifestEnabled: p.manifestEnabled,
+            overridden: !!this.switches && this.switches.get(p.id) !== undefined,
             error: p.error,
             tools: p.tools.map((t) => ({ name: t.localName, globalName: t.globalName, purpose: t.purpose })),
         }));
@@ -469,6 +578,85 @@ export class PluginRegistry {
     /** 可用工具数（只算已启用且加载成功的）。 */
     get availableToolCount() {
         return this.byTool.size;
+    }
+    /** 找到插件定义（按 id），不含工具解析。 */
+    get(id) {
+        try {
+            return this.plugins.find((p) => p.id === id) || null;
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * 独立开启 / 关闭某个插件：写持久化状态并立即重建工具清单。
+     * 不抛异常，失败只回 error 文案。
+     */
+    setEnabled(id, enabled) {
+        try {
+            const def = this.get(id);
+            if (!def)
+                return { ok: false, error: '没有这个插件：' + id };
+            if (enabled && def.error)
+                return { ok: false, error: '插件加载失败，无法启用：' + def.error };
+            if (!this.switches)
+                return { ok: false, error: '插件开关存储不可用（未注入 PluginSwitchStore）' };
+            if (!this.switches.set(id, enabled))
+                return { ok: false, error: '写入插件开关状态失败：' + this.switches.path };
+            this.reload();
+            const after = this.get(id);
+            if (!after)
+                return { ok: false, error: '重新扫描后找不到该插件：' + id };
+            if (!enabled && this.byTool.size >= 0) {
+                // 关闭后必须确认其工具确实撤出清单
+                const still = after.tools.filter((t) => this.byTool.has(t.globalName)).length;
+                if (still > 0)
+                    return { ok: false, error: '关闭后仍有 ' + still + ' 个工具留在清单里' };
+            }
+            return { ok: true, error: '' };
+        }
+        catch (e) {
+            return { ok: false, error: '切换插件开关异常：' + msgOf(e) };
+        }
+    }
+    /**
+     * 删除单个插件：整个插件目录移入回收站（可手工找回），不做物理删除。
+     * 只允许删除插件根目录的直接子目录，防止路径越界。
+     */
+    remove(id) {
+        try {
+            const def = this.get(id);
+            if (!def)
+                return { ok: false, error: '没有这个插件：' + id, movedTo: '' };
+            const root = path.resolve(this.root);
+            const target = path.resolve(def.dir);
+            if (path.dirname(target) !== root) {
+                return { ok: false, error: '插件目录不在插件根目录下，拒绝删除', movedTo: '' };
+            }
+            if (!fs.existsSync(target))
+                return { ok: false, error: '插件目录已不存在：' + target, movedTo: '' };
+            const trash = this.trashDirectory;
+            fs.mkdirSync(trash, { recursive: true });
+            const baseName = path.basename(target) + '__' + trashStamp();
+            let dest = path.join(trash, baseName);
+            for (let i = 2; fs.existsSync(dest) && i < 100; i++)
+                dest = path.join(trash, baseName + '_' + i);
+            try {
+                fs.renameSync(target, dest);
+            }
+            catch {
+                // 跨卷等情况下退化为复制 + 删除
+                fs.cpSync(target, dest, { recursive: true });
+                fs.rmSync(target, { recursive: true, force: true });
+            }
+            if (this.switches)
+                this.switches.forget(id);
+            this.reload();
+            return { ok: true, error: '', movedTo: dest };
+        }
+        catch (e) {
+            return { ok: false, error: '删除插件失败：' + msgOf(e), movedTo: '' };
+        }
     }
     /** 转成 OpenAI 工具清单；插件异常时返回空数组，调用方照常用核心清单。 */
     toolSpecs() {

@@ -3,17 +3,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppState, Attachment, ChatItem, PluginInfo, PluginState, PublicSettings, ServerEvent, TargetWindow } from '../shared/types.js';
-import { dataDirPath, getSettings, updateSettings, type ServerSettings } from './settings.js';
+import { dataDirPath, getSettings, updateSettings, resolveModelSettings, type ServerSettings } from './settings.js';
 import { defaultWorkspace, timeLabel } from './paths.js';
 import { AgentRunner, type AgentSnapshot } from './agent.js';
 import { ToolExecutor } from './tools.js';
-import { PluginRegistry } from './plugins.js';
+import { PluginRegistry, PluginSwitchStore } from './plugins.js';
 import { NativeBridge } from './native.js';
 import { SessionStore, deriveTitleFromPrompt, isDefaultTitle } from './sessions.js';
 import { GlobalTipsStore } from './tips.js';
 import { getImage } from './imagestore.js';
 import { NOTES_MAX_CHARS } from '../shared/prompt.js';
-import { testConnection } from './llm.js';
+import { testConnections } from './llm.js';
 import { splitInputTokens } from '../shared/pricing.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -69,8 +69,27 @@ tools.setSessionRenamer((sessionId, title) => {
   broadcastSessions();
   return meta.title;
 });
+// 模型可用 search_sessions 跨会话检索历史对话（只读，用于对比过往做法）
+tools.setSessionSearcher((query, opts) => sessions.search(query, opts));
+// 工具场景改为**会话级**：每个对话单独持有档位与「注入指引」开关，多会话并行互不影响。
+// 全局 settings 里的 toolScene/sceneGuideEnabled 只作新会话默认值（旧会话未设置时也回落到它）。
+tools.setSceneResolver((sessionId) => sessions.sceneOf(sessionId));
+tools.setSceneApplier((sessionId, scene) => {
+  const next = sessions.setScene(sessionId, { toolScene: scene });
+  if (!next) return '';
+  broadcastSessions();
+  broadcast({ type: 'scene', sessionId, scene: next });
+  return next.toolScene;
+});
 // 插件系统：清单 + 子进程，与核心完全隔离（见 server/plugins.ts 顶部说明）
-const pluginRegistry = new PluginRegistry(path.join(dataDirPath(), 'plugins'), () => getSettings().pluginTimeoutMs);
+const pluginSwitches = new PluginSwitchStore(path.join(dataDirPath(), 'plugins_state.json'));
+pluginSwitches.load();
+const pluginRegistry = new PluginRegistry(
+  path.join(dataDirPath(), 'plugins'),
+  () => getSettings().pluginTimeoutMs,
+  [],
+  pluginSwitches,
+);
 tools.setPluginRegistry(pluginRegistry);
 try {
   pluginRegistry.reload();
@@ -277,6 +296,7 @@ function pluginState(): PluginState {
   return {
     enabled: !!getSettings().pluginsEnabled,
     dir: pluginRegistry.directory,
+    trashDir: pluginRegistry.trashDirectory,
     auditCount: pluginAuditCount,
     items,
   };
@@ -429,6 +449,7 @@ function currentState(sessionId?: string): AppState {
         hasSession: runner.hasSession,
       };
     })(),
+    scene: sessions.sceneOf(id),
     target,
     record,
     notes,
@@ -455,8 +476,18 @@ function currentState(sessionId?: string): AppState {
 }
 
 function publicSettings(s: ServerSettings): PublicSettings {
-  const { apiKey, cloudTtsApiKey, ...rest } = s;
-  return { ...rest, hasApiKey: !!apiKey.trim(), hasCloudTtsApiKey: !!cloudTtsApiKey.trim() };
+  const { apiKey, cloudTtsApiKey, modelProfiles, ...rest } = s;
+  return {
+    ...rest,
+    // 多模型：逐个剔掉密钥，只留「已保存」标记；其余字段（含逐项覆盖项）原样透传，
+    // 客户端据此回填「留空 = 沿用全局」的表单，无需猜测缺省语义
+    modelProfiles: modelProfiles.map(({ apiKey, ...rest }) => ({
+      ...rest,
+      hasApiKey: !!apiKey.trim(),
+    })),
+    hasApiKey: !!apiKey.trim(),
+    hasCloudTtsApiKey: !!cloudTtsApiKey.trim(),
+  };
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -663,6 +694,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- 历史检索（只读）：跨会话搜索对话，供界面与 agent 对比过往做法 ----
+    if (req.method === 'GET' && pathname === '/api/sessions/search') {
+      const q = (url.searchParams.get('q') || '').trim();
+      if (!q) {
+        json(res, 400, { error: '缺少查询关键词 q。用法：/api/sessions/search?q=关键词&scope=chat|all' });
+        return;
+      }
+      const scope = url.searchParams.get('scope') === 'all' ? 'all' : 'chat';
+      const report = sessions.search(q, {
+        scope,
+        maxGroups: Number(url.searchParams.get('max') || '') || undefined,
+        maxPerSession: Number(url.searchParams.get('per') || '') || undefined,
+      });
+      json(res, 200, { ok: true, ...report });
+      return;
+    }
+
     if (req.method === 'POST' && /^\/api\/sessions\/[^/]+\/rename$/.test(pathname)) {
       const id = pathname.split('/')[3] || '';
       const body = await readBody(req);
@@ -673,6 +721,23 @@ const server = http.createServer(async (req, res) => {
       }
       broadcastSessions();
       json(res, 200, { ok: true, session: meta });
+      return;
+    }
+
+    // ---- 会话级工具场景：界面「工具场景」分区与输入框下方 pill 的保存入口 ----
+    if (req.method === 'POST' && /^\/api\/sessions\/[^/]+\/scene$/.test(pathname)) {
+      const id = pathname.split('/')[3] || '';
+      const body = await readBody(req);
+      const next = sessions.setScene(id, {
+        toolScene: body && typeof body === 'object' ? (body as Record<string, unknown>).toolScene : undefined,
+        sceneGuideEnabled: body && typeof body === 'object' ? (body as Record<string, unknown>).sceneGuideEnabled : undefined,
+      });
+      if (!next) {
+        json(res, 404, { error: '会话不存在' });
+        return;
+      }
+      broadcast({ type: 'scene', sessionId: id, scene: next });
+      json(res, 200, { ok: true, scene: next, state: currentState(id) });
       return;
     }
 
@@ -737,6 +802,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- 切换模型（对话框里的下拉）----
+    if (req.method === 'POST' && pathname === '/api/model/select') {
+      const body = await readBody(req);
+      const id = body && typeof body === 'object' ? (body as Record<string, unknown>).id : '';
+      const next = updateSettings({ activeModelId: typeof id === 'string' ? id : '' });
+      tools.updateSettings(next);
+      const active = resolveModelSettings(next);
+      json(res, 200, {
+        ok: true,
+        activeModelId: next.activeModelId,
+        // 实际生效的模型名（id 无效时会回落为全局模型，界面据此纠正下拉框）
+        model: active.model,
+        state: currentState(),
+      });
+      return;
+    }
+
     // ---- 窗口 ----
     if (req.method === 'GET' && pathname === '/api/windows') {
       if (!native.available) {
@@ -789,6 +871,20 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (activeRun && activeRun.runner.isRunning) {
+        // 同一个会话正在跑：不拒绝，把这条消息插进正在跑的循环，下一轮请求生效
+        if (activeRun.sessionId === sessionId) {
+          const injected = activeRun.runner.injectUserMessage(prompt, parseAttachments(body?.attachments));
+          if (injected.ok) {
+            json(res, 200, {
+              ok: true,
+              sessionId,
+              injected: true,
+              turn: activeRun.runner.currentTurn,
+              state: currentState(sessionId),
+            });
+            return;
+          }
+        }
         json(res, 409, {
           error: activeRun.sessionId === sessionId
             ? '该会话正在运行中'
@@ -814,6 +910,28 @@ const server = http.createServer(async (req, res) => {
         broadcastSessions();
       });
       json(res, 200, { ok: true, sessionId });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/agent/message') {
+      const body = await readBody(req, 24 * 1024 * 1024);
+      const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
+      const sessionId = ensureSession(body?.sessionId);
+      const runner = runners.get(sessionId);
+      if (!prompt) {
+        json(res, 400, { error: '请输入要插入的内容' });
+        return;
+      }
+      if (!runner || !runner.isRunning) {
+        json(res, 409, { error: '该会话当前没有运行，请直接开始任务', notRunning: true });
+        return;
+      }
+      const injected = runner.injectUserMessage(prompt, parseAttachments(body?.attachments));
+      if (!injected.ok) {
+        json(res, 400, { error: injected.reason === 'empty' ? '请输入要插入的内容' : '无法插入消息' });
+        return;
+      }
+      json(res, 200, { ok: true, sessionId, injected: true, turn: runner.currentTurn, state: currentState(sessionId) });
       return;
     }
 
@@ -898,6 +1016,45 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- 单个插件：独立开启 / 关闭 ----
+    if (req.method === 'POST' && pathname === '/api/plugins/toggle') {
+      const body = await readBody(req);
+      const id = typeof body?.id === 'string' ? body.id.trim() : '';
+      if (!id) {
+        json(res, 400, { error: '缺少插件 id' });
+        return;
+      }
+      const enabled = body?.enabled === true;
+      const r = pluginRegistry.setEnabled(id, enabled);
+      const payload = pluginState();
+      broadcast({ type: 'plugins', plugins: payload });
+      if (!r.ok) {
+        json(res, 400, { error: r.error, plugins: payload });
+        return;
+      }
+      json(res, 200, { ok: true, id, enabled, availableToolCount: pluginRegistry.availableToolCount, plugins: payload });
+      return;
+    }
+
+    // ---- 单个插件：删除（移入回收站，可手工找回）----
+    if (req.method === 'POST' && pathname === '/api/plugins/remove') {
+      const body = await readBody(req);
+      const id = typeof body?.id === 'string' ? body.id.trim() : '';
+      if (!id) {
+        json(res, 400, { error: '缺少插件 id' });
+        return;
+      }
+      const r = pluginRegistry.remove(id);
+      const payload = pluginState();
+      broadcast({ type: 'plugins', plugins: payload });
+      if (!r.ok) {
+        json(res, 400, { error: r.error, plugins: payload });
+        return;
+      }
+      json(res, 200, { ok: true, id, movedTo: r.movedTo, availableToolCount: pluginRegistry.availableToolCount, plugins: payload });
+      return;
+    }
+
     // ---- 插件调用审计响应 ----
     if (req.method === 'POST' && pathname === '/api/plugin/respond') {
       const body = await readBody(req);
@@ -930,9 +1087,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && pathname === '/api/test-connection') {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30_000);
+      const timer = setTimeout(() => controller.abort(), 40_000);
       try {
-        const result = await testConnection(getSettings(), controller.signal);
+        const result = await testConnections(getSettings(), controller.signal);
         json(res, 200, result);
       } finally {
         clearTimeout(timer);
@@ -1022,6 +1179,12 @@ server.listen(PORT, HOST, () => {
   if (!native.supported) {
     console.log('原生桥接不可用：当前平台 ' + process.platform);
   } else {
+    // 掉线 / 自动重启都要推给前端：否则横幅会永久停在「原生控制不可用」，
+    // 直到用户手动重启服务（这正是本次故障暴露的问题）
+    native.setChangeListener((available, detail) => {
+      broadcast({ type: 'native', available, detail });
+      console.log((available ? '原生桥接已连接：' : '原生桥接不可用：') + detail);
+    });
     native.start().then((ok) => {
       console.log(ok ? '原生桥接已就绪：' + native.detail : '原生桥接启动失败：' + native.detail);
       broadcast({ type: 'native', available: native.available, detail: native.detail });

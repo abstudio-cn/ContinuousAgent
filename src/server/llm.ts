@@ -1,5 +1,5 @@
 import type { ChatMessage, ToolCall } from '../shared/types.js';
-import type { ServerSettings } from './settings.js';
+import { resolveModelSettings, type ServerSettings } from './settings.js';
 import { sanitizeHistory } from './history.js';
 
 export type LlmEvent =
@@ -209,6 +209,10 @@ export async function* streamChat(
     messages: buildMessages(messages, true, settings.screenshotBurnAfterRead),
     stream: true,
     max_tokens: Math.max(256, settings.maxOutputTokens),
+    // 让服务端在流末尾补一块 usage：OpenAI / DeepSeek / llama.cpp 都支持。
+    // 不请求时多数服务端在流式响应里根本不带 usage，token 计量、缓存命中与
+    // 费用统计会全盲（实测本地 llama.cpp：不带=NONE，带上才有 prompt_tokens）。
+    stream_options: { include_usage: true },
   };
   if (tools.length > 0) {
     body.tools = tools;
@@ -220,6 +224,10 @@ export async function* streamChat(
     body.reasoning_effort = effort;
     if (effort !== 'minimal') delete body.temperature;
   }
+  // 关闭模型思考（Qwen3 等本地模型）：思考 token 同样计入并逐字生成，
+  // 在 10 tok/s 级本地模型上是最大的延迟来源（实测输出 154 → 14 tokens）。
+  // 字段走 llama.cpp 的 chat_template_kwargs，云端服务商不认时下面会自动回退。
+  if (settings.disableThinking) body.chat_template_kwargs = { enable_thinking: false };
 
   const send = async (payload: Record<string, unknown>) => {
     const json = JSON.stringify(payload);
@@ -236,7 +244,6 @@ export async function* streamChat(
     return json;
   };
 
-  const payloadText = await send({ ...body });
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'text/event-stream',
@@ -244,20 +251,25 @@ export async function* streamChat(
   };
   if (settings.apiKey.trim()) headers.Authorization = 'Bearer ' + settings.apiKey.trim();
 
-  let resp: Response;
-  try {
-    resp = await fetch(endpoint(settings.apiBaseUrl), {
-      method: 'POST',
-      headers,
-      body: payloadText,
-      signal,
-    });
-  } catch (err) {
-    if (signal.aborted) throw err;
-    throw new LlmError('网络错误: ' + (err instanceof Error ? err.message : String(err)));
-  }
-
-  if (!resp.ok) {
+  // 可选字段的兼容回退：stream_options / chat_template_kwargs 不是所有 OpenAI 兼容
+  // 服务商都认，被拒绝时逐个去掉重试一次，绝不让「优化」把请求变成硬错误。
+  const OPTIONAL_FIELDS = ['stream_options', 'chat_template_kwargs'];
+  const attemptBody: Record<string, unknown> = { ...body };
+  let resp: Response | null = null;
+  while (true) {
+    const payloadText = await send({ ...attemptBody });
+    try {
+      resp = await fetch(endpoint(settings.apiBaseUrl), {
+        method: 'POST',
+        headers,
+        body: payloadText,
+        signal,
+      });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      throw new LlmError('网络错误: ' + (err instanceof Error ? err.message : String(err)));
+    }
+    if (resp.ok) break;
     let detail = '';
     try {
       detail = await resp.text();
@@ -265,8 +277,18 @@ export async function* streamChat(
       /* ignore */
     }
     if (detail.length > 1200) detail = detail.slice(0, 1200);
-    throw new LlmError('HTTP ' + resp.status + ' ' + (resp.statusText || '') + ': ' + detail);
+    const status = resp.status;
+    const rejected = OPTIONAL_FIELDS.find(
+      (f) => f in attemptBody && new RegExp(f.replace(/_/g, '[_ ]?'), 'i').test(detail),
+    );
+    if (rejected && (status === 400 || status === 422 || status === 500)) {
+      delete attemptBody[rejected];
+      console.warn('[llm] 服务端拒绝可选字段 ' + rejected + '（HTTP ' + status + '），已去掉重试：' + detail);
+      continue;
+    }
+    throw new LlmError('HTTP ' + status + ' ' + (resp.statusText || '') + ': ' + detail);
   }
+  if (!resp) throw new LlmError('网络错误: 请求没有返回响应');
 
   // 请求已被接受 → 这些截图算“读过”，下一轮不再携带（失败时不标记，保证重试还能带上图）
   if (settings.screenshotBurnAfterRead) markImagesConsumed(messages);
@@ -349,6 +371,85 @@ export async function* streamChat(
   }
 
   yield { type: 'finished', reason: finish };
+}
+
+/** 单条连通性测试的结果：带上「测的是哪套配置、哪把钥匙」，便于定位 401 这类鉴权问题。 */
+export interface ConnectionTestResult {
+  id: string;
+  name: string;
+  model: string;
+  apiBaseUrl: string;
+  keyTail: string;
+  ok: boolean;
+  message: string;
+  ms: number;
+}
+
+/** 密钥末四位；只用于让人看出测的是哪把钥匙，不暴露完整密钥。 */
+function keyTailOf(key: string): string {
+  const k = (key || '').trim();
+  return k.length > 4 ? '****' + k.slice(-4) : k ? '****' : '（未填密钥）';
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max ? text.slice(0, max) + '…' : text;
+}
+
+/**
+ * 多 API 测试：每个待测目标各发一次最小请求。
+ *
+ * 待测目标口径与聊天一致（都用 resolveModelSettings 逐项覆盖）：
+ * - 启用了模型清单 → 逐条测清单里的每个模型（行内留空回落全局）；
+ * - 清单为空 → 退回测全局配置，等价于旧版的单条测试。
+ *
+ * 这样「测的」与「用的」永远是同一把钥匙——旧实现直接测全局 apiKey，
+ * 在「全局 key 已失效、真实 key 配在行内」时会误报 401。
+ */
+export async function testConnections(
+  settings: ServerSettings,
+  signal: AbortSignal,
+  perTestMs = 20_000,
+): Promise<{ ok: boolean; message: string; results: ConnectionTestResult[] }> {
+  const targets = settings.modelProfiles.length > 0
+    ? settings.modelProfiles.map((p) => ({
+      id: p.id,
+      name: p.name || p.model,
+      cfg: resolveModelSettings({ ...settings, activeModelId: p.id }),
+    }))
+    : [{ id: '', name: '全局配置', cfg: settings }];
+
+  const results = await Promise.all(targets.map(async (t) => {
+    const started = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), perTestMs);
+    const relay = () => ctrl.abort();
+    signal.addEventListener('abort', relay, { once: true });
+    try {
+      const r = await testConnection(t.cfg, ctrl.signal);
+      return {
+        id: t.id,
+        name: t.name,
+        model: t.cfg.model,
+        apiBaseUrl: t.cfg.apiBaseUrl,
+        keyTail: keyTailOf(t.cfg.apiKey),
+        ok: r.ok,
+        message: r.message,
+        ms: Date.now() - started,
+      };
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', relay);
+    }
+  }));
+
+  const failed = results.filter((r) => !r.ok);
+  const parts = failed.map((r) => r.name + '（' + r.keyTail + '）' + clip(r.message, 200));
+  const message = results.length === 1
+    ? results[0].message
+    : failed.length === 0
+      ? '全部 ' + results.length + ' 个 API 连接成功，模型可用。'
+      : (results.length - failed.length) + '/' + results.length + ' 个 API 可用；失败：' + parts.join('；');
+  return { ok: results.length > 0 && failed.length === 0, message, results };
 }
 
 export async function testConnection(settings: ServerSettings, signal: AbortSignal): Promise<{ ok: boolean; message: string }> {

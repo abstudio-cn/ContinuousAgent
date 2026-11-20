@@ -2,6 +2,53 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { NOTES_MAX_CHARS, NOTES_TEMPLATE, RECORD_TEMPLATE } from '../shared/prompt.js';
 import { ensureDir, isInsideWorkspace } from './paths.js';
+/** 「## 任务计划」里的一条勾选项：`- [ ] P1 …` / `- [x] P1 …`。 */
+const PLAN_ITEM_RE = /^\s*[-*]\s+\[([ xX])\]\s*\S/;
+/** 取「## 任务计划」小节的正文行（到下一个二级标题或文末为止）。 */
+export function taskPlanLines(markdown) {
+    const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+    const start = lines.findIndex((l) => /^##\s*任务计划/.test(l.trim()));
+    if (start < 0)
+        return [];
+    const body = [];
+    for (let i = start + 1; i < lines.length; i++) {
+        const line = lines[i] ?? '';
+        if (/^##\s/.test(line.trim()))
+            break;
+        body.push(line);
+    }
+    return body;
+}
+/** 工作记录里是否已有真正的任务计划（模板占位不算）。 */
+export function hasTaskPlan(markdown) {
+    const items = taskPlanLines(markdown).filter((l) => PLAN_ITEM_RE.test(l));
+    if (items.length === 0)
+        return false;
+    // 初始模板只有一条占位项，不算“已规划”
+    return !(items.length === 1 && /待填|把任务拆成/.test(items[0] ?? ''));
+}
+/** 任务计划里是否还有未勾选的步骤。 */
+export function hasOpenPlanStep(markdown) {
+    return taskPlanLines(markdown).some((l) => {
+        const m = PLAN_ITEM_RE.exec(l);
+        return !!m && m[1] === ' ';
+    });
+}
+/**
+ * 需要「先规划」提醒时返回提醒文案，否则返回 null。
+ * 用于 agent 主循环的开工守卫：光靠提示词是软约束，这里保证最低限度的提醒。
+ */
+export function planNudge(markdown) {
+    if (!hasTaskPlan(markdown)) {
+        return '先别动手：请先规划任务——调用 update_work_record，在工作记录的「## 任务计划」下写出 2~8 个有序、可验证的步骤'
+            + '（每条一行 `- [ ] P1 …`），并在「## 任务目标」写清完成标准；计划落盘之后再开始第一步。';
+    }
+    if (!hasOpenPlanStep(markdown)) {
+        return '工作记录「## 任务计划」里的步骤已全部勾选。如果这是新任务（或旧计划已不适用），请先重新规划：'
+            + '把「## 任务计划」改写成接下来的步骤（`- [ ] P1 …`）再动手；确实没有后续步骤时，直接给出结论并收尾。';
+    }
+    return null;
+}
 /** 单个会话的工作记录文件。每次更新整文件覆盖，不保留历史。 */
 export class WorkRecordService {
     filePath;

@@ -1,10 +1,47 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { NOTES_TEMPLATE, RECORD_TEMPLATE } from '../shared/prompt.js';
+import { isSceneId, DEFAULT_SCENE } from '../shared/scenes.js';
 import { ensureDir, stamp } from './paths.js';
 import { sanitizeHistory, trimHistoryMessages } from './history.js';
 const MAX_TIMELINE_ITEMS = 240;
 const MAX_HISTORY_MESSAGES = 80;
+// ---- 历史检索上限（防止一次搜索把全部会话无界读入）----
+/** 单次检索最多拆多少个关键词 */
+const MAX_SEARCH_TERMS = 8;
+/** 单次检索最多扫多少个会话 */
+const DEFAULT_SEARCH_SESSIONS = 120;
+/** 每个会话最多返回几条命中片段 */
+const DEFAULT_SEARCH_PER_SESSION = 3;
+/** 最多返回多少个会话分组 */
+const DEFAULT_SEARCH_GROUPS = 20;
+/** 单条候选文本最多扫多长（超长助手回复/工具输出只扫前段，避免放大成 O(全量字符)） */
+const MAX_SEARCH_SCAN_CHARS = 200_000;
+/** 片段前后各留多少字符 */
+const SNIPPET_RADIUS = 40;
+function clampInt(v, min, max, fallback) {
+    const n = Math.floor(Number(v));
+    if (!Number.isFinite(n))
+        return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+/** 截取命中点周围的一段文本：折叠空白、两端补省略号。命中点取「最早出现的那个关键词」。 */
+function searchSnippet(text, terms) {
+    const lower = text.toLowerCase();
+    let at = -1;
+    for (const t of terms) {
+        const i = lower.indexOf(t);
+        if (i >= 0 && (at < 0 || i < at))
+            at = i;
+    }
+    const flat = (s) => s.replace(/\s+/g, ' ').trim();
+    if (at < 0)
+        return flat(text).slice(0, SNIPPET_RADIUS * 2);
+    // 命中点向左扩展时，若正好落在词中间也无需精细对齐：片段只用于展示
+    const start = Math.max(0, at - SNIPPET_RADIUS);
+    const end = Math.min(text.length, at + SNIPPET_RADIUS * 2);
+    return (start > 0 ? '…' : '') + flat(text.slice(start, end)) + (end < text.length ? '…' : '');
+}
 /** 会话元数据与运行数据存储。记录/笔记落在工作空间的 sessions/<id>/ 下，做到会话隔离。 */
 export class SessionStore {
     rootDir;
@@ -42,10 +79,10 @@ export class SessionStore {
         return path.join(this.getSettings().workspacePath, 'sessions', id);
     }
     recordPath(id) {
-        return this.preferExisting(id, this.getSettings().gameRecordFileName, 'game_state.md');
+        return this.preferExisting(id, this.getSettings().gameRecordFileName || 'game_state.md', 'game_state.md');
     }
     notesPath(id) {
-        return this.preferExisting(id, this.getSettings().gameNotesFileName, 'game_notes.md');
+        return this.preferExisting(id, this.getSettings().gameNotesFileName || 'game_notes.md', 'game_notes.md');
     }
     /** 兼容改名前的旧文件名：新名字不存在但旧文件在时，继续用旧文件，避免历史内容“消失”。 */
     preferExisting(id, fileName, legacyName) {
@@ -72,11 +109,54 @@ export class SessionStore {
             title: (title || '').trim() || defaultTitle(now),
             createdAt: now,
             updatedAt: now,
+            // 新会话的默认场景固定为「通用」：不跟随全局设置，避免新建的对话凭空带上
+            // 之前为某个对话选过的场景。全局 toolScene 只对更早的「无场景字段」会话生效。
+            toolScene: DEFAULT_SCENE,
         };
         this.meta.push(meta);
         this.writeIndex();
         this.ensureFiles(id);
         return meta;
+    }
+    /**
+     * 读取会话的生效场景：会话里单独设置过的字段优先，其余回落全局设置。
+     * 这样旧会话（没有这两个字段）行为与改动前一致，新会话各自独立。
+     */
+    sceneOf(id) {
+        const s = this.getSettings();
+        const meta = this.get(id);
+        const base = {
+            toolScene: s.toolScene || DEFAULT_SCENE,
+            sceneGuideEnabled: !!s.sceneGuideEnabled,
+            inherited: true,
+        };
+        if (!meta)
+            return base;
+        const hasScene = isSceneId(meta.toolScene);
+        const hasGuide = typeof meta.sceneGuideEnabled === 'boolean';
+        if (!hasScene && !hasGuide)
+            return base;
+        return {
+            toolScene: hasScene ? meta.toolScene : base.toolScene,
+            sceneGuideEnabled: hasGuide ? !!meta.sceneGuideEnabled : base.sceneGuideEnabled,
+            inherited: false,
+        };
+    }
+    /** 设置会话级场景（只写传进来的字段）；会话不存在返回 null。 */
+    setScene(id, patch) {
+        const meta = this.get(id);
+        if (!meta)
+            return null;
+        if (patch.toolScene !== undefined) {
+            const scene = typeof patch.toolScene === 'string' ? patch.toolScene.trim().toLowerCase() : '';
+            if (isSceneId(scene))
+                meta.toolScene = scene;
+        }
+        if (patch.sceneGuideEnabled !== undefined)
+            meta.sceneGuideEnabled = !!patch.sceneGuideEnabled;
+        meta.updatedAt = Date.now();
+        this.writeIndex();
+        return this.sceneOf(id);
     }
     rename(id, title) {
         const meta = this.get(id);
@@ -150,6 +230,121 @@ export class SessionStore {
             return '(读取工作笔记失败: ' + (e instanceof Error ? e.message : String(e)) + ')';
         }
     }
+    /** 只读读取文本文件：不存在/读失败一律空串，且**不**建目录、不写模板（检索必须是纯只读）。 */
+    readTextIfExists(file) {
+        try {
+            return fs.readFileSync(file, 'utf8');
+        }
+        catch {
+            return '';
+        }
+    }
+    timelineFile(id) {
+        return path.join(this.rootDir, id, 'timeline.json');
+    }
+    /**
+     * 跨会话检索历史（纯只读：不建目录、不写盘、不改任何历史数据）。
+     * 关键词按空白拆分，**全部命中**才算命中（AND）；大小写不敏感，中文按子串。
+     * 结果按「命中词数 → 命中条目数 → 最近更新」排序，并带上限避免一次读爆。
+     */
+    search(query, opts = {}) {
+        const terms = Array.from(new Set(String(query ?? '')
+            .toLowerCase()
+            .split(/\s+/)
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0))).slice(0, MAX_SEARCH_TERMS);
+        const scope = opts.scope === 'all' ? 'all' : 'chat';
+        const report = {
+            query: String(query ?? '').trim(),
+            terms,
+            scope,
+            scanned: 0,
+            totalHits: 0,
+            groups: [],
+            truncated: false,
+        };
+        if (terms.length === 0)
+            return report;
+        const maxSessions = clampInt(opts.maxSessions, 1, 500, DEFAULT_SEARCH_SESSIONS);
+        const maxPerSession = clampInt(opts.maxPerSession, 1, 20, DEFAULT_SEARCH_PER_SESSION);
+        const maxGroups = clampInt(opts.maxGroups, 1, 100, DEFAULT_SEARCH_GROUPS);
+        for (const meta of this.list()) {
+            if (report.scanned >= maxSessions) {
+                report.truncated = true;
+                break;
+            }
+            report.scanned++;
+            const hits = [];
+            const matchedTerms = new Set();
+            let hitCount = 0;
+            // 单条候选文本：全部关键词命中才计入；只取前若干条命中做片段，其余仅计数
+            const consider = (kind, itemId, time, raw) => {
+                if (!raw)
+                    return;
+                const text = raw.length > MAX_SEARCH_SCAN_CHARS ? raw.slice(0, MAX_SEARCH_SCAN_CHARS) : raw;
+                const lower = text.toLowerCase();
+                for (const t of terms)
+                    if (!lower.includes(t))
+                        return;
+                hitCount++;
+                for (const t of terms)
+                    matchedTerms.add(t);
+                if (hits.length < maxPerSession) {
+                    hits.push({ itemId, kind, time, matched: [...terms], snippet: searchSnippet(text, terms) });
+                }
+            };
+            consider('session-title', '', '', meta.title);
+            const timelineRaw = this.readTextIfExists(this.timelineFile(meta.id));
+            if (timelineRaw) {
+                let items = [];
+                try {
+                    const arr = JSON.parse(timelineRaw);
+                    if (Array.isArray(arr))
+                        items = arr;
+                }
+                catch {
+                    items = []; // 时间线损坏：跳过该会话的对话部分，不影响其它会话
+                }
+                for (const item of items) {
+                    if (!item || typeof item.text !== 'string')
+                        continue;
+                    const isChat = item.kind === 'user' || item.kind === 'assistant' || item.kind === 'system';
+                    if (scope === 'chat' && !isChat)
+                        continue;
+                    // 对话范围只搜正文；范围 all 时把工具产物/详情也纳入（对比「当时到底跑了什么」很有用）
+                    const raw = scope === 'all'
+                        ? [item.title, item.text, item.detail, item.meta].filter(Boolean).join('\n')
+                        : item.text;
+                    consider(item.kind, item.id || '', item.time || '', raw);
+                }
+            }
+            if (scope === 'all') {
+                consider('record', '', '', this.readTextIfExists(this.recordPath(meta.id)));
+                consider('notes', '', '', this.readTextIfExists(this.notesPath(meta.id)));
+            }
+            if (hitCount > 0) {
+                report.totalHits += hitCount;
+                report.groups.push({
+                    sessionId: meta.id,
+                    title: meta.title,
+                    updatedAt: meta.updatedAt,
+                    hitCount,
+                    score: matchedTerms.size,
+                    hits,
+                });
+            }
+        }
+        // 每会话命中片段数被 per 截断时，整体结果同样不完整，必须如实标记；
+        // 否则调用方会把「每组只剩 N 条」当成「一共只有 N 条命中」。
+        if (report.groups.some((g) => g.hitCount > g.hits.length))
+            report.truncated = true;
+        report.groups.sort((a, b) => b.score - a.score || b.hitCount - a.hitCount || b.updatedAt - a.updatedAt);
+        if (report.groups.length > maxGroups) {
+            report.groups = report.groups.slice(0, maxGroups);
+            report.truncated = true;
+        }
+        return report;
+    }
     // ---- 运行数据（时间线/历史/用量） ----
     runtimeDir(id) {
         const dir = path.join(this.rootDir, id);
@@ -208,6 +403,8 @@ export class SessionStore {
                 reasoning: m.reasoning ?? null,
                 toolCalls: m.toolCalls ?? null,
                 toolCallId: m.toolCallId ?? null,
+                // 任务首轮保留标记随历史落盘：服务重启后仍能保住本次任务的首轮对话
+                pinned: m.pinned ?? null,
             }));
             fs.writeFileSync(path.join(this.runtimeDir(id), 'history.json'), JSON.stringify(trimmed), 'utf8');
         }
